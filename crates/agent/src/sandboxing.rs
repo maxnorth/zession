@@ -25,6 +25,7 @@
 //! Naming note: this module is about agent terminal sandboxing specifically.
 //! Other agent operations (e.g. file edits) are gated separately.
 
+use crate::session_sandbox::{session_home, session_home_for_roots};
 use agent_settings::{AgentSettings, SandboxPermissions};
 use feature_flags::{FeatureFlagAppExt as _, SandboxingFeatureFlag};
 use gpui::App;
@@ -40,10 +41,14 @@ use std::path::PathBuf;
 /// [`acp_thread::SandboxWrap::writable_paths`]) and the status UI (which lists
 /// them), so the two can't drift if the set ever changes.
 pub fn sandbox_worktree_writable_paths(project: &Project, cx: &App) -> Vec<PathBuf> {
-    project
+    let mut writable_paths = project
         .worktrees(cx)
         .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(session_home) = session_home_for_roots(&session_home(), &writable_paths) {
+        writable_paths.push(session_home);
+    }
+    writable_paths
 }
 
 /// The candidate `.git` paths the sandbox protects for a project. Locating these

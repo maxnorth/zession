@@ -3,6 +3,7 @@ use agent_client_protocol::v2::schema as acp_v2;
 use anyhow::Result;
 use futures::FutureExt as _;
 use gpui::{App, AsyncApp, Entity, SharedString, Task};
+use http_proxy::HostPattern;
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -17,9 +18,10 @@ use std::{
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::SandboxFallbackDecision;
 use crate::sandboxing::{
-    NetworkRequest, sandbox_git_dirs, sandbox_worktree_writable_paths,
+    NetworkRequest, insert_host_pattern, sandbox_git_dirs, sandbox_worktree_writable_paths,
     sandboxing_enabled_for_project,
 };
+use crate::session_sandbox::{session_home, session_home_for_roots, session_network_hosts};
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
@@ -447,22 +449,61 @@ async fn run_terminal_tool(
 
     authorize.await.map_err(|e| e.to_string())?;
 
+    let session_hosts = if sandboxing
+        && (cfg!(target_os = "macos") || cfg!(target_os = "linux"))
+        && is_local_project
+    {
+        let worktree_roots = cx.update(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        if let Some(session_home) = session_home_for_roots(&session_home(), &worktree_roots) {
+            let hosts = cx
+                .background_executor()
+                .spawn(async move { session_network_hosts(&session_home).await })
+                .await;
+            let mut host_patterns = Vec::new();
+            for host in hosts {
+                match HostPattern::parse(&host) {
+                    Ok(host) => insert_host_pattern(&mut host_patterns, host),
+                    Err(error) => {
+                        log::warn!("ignoring invalid Session sandbox host '{host}': {error}")
+                    }
+                }
+            }
+            host_patterns
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
     let want_fs_write_all = sandboxing && sandbox_input.allow_fs_write_all == Some(true);
     let want_unsandboxed = sandboxing && sandbox_input.unsandboxed == Some(true);
     let want_all_hosts = sandboxing && sandbox_input.allow_all_hosts == Some(true);
 
-    let persistent = cx.update(|cx| {
+    let mut persistent = cx.update(|cx| {
         agent_settings::AgentSettings::get_global(cx)
             .sandbox_permissions
             .clone()
     });
+    for host in &session_hosts {
+        let host = host.to_string();
+        if !persistent.network_hosts.contains(&host) {
+            persistent.network_hosts.push(host);
+        }
+    }
 
-    // Standing permissions the user already approved — in settings or "for this
-    // thread" — that every command in the thread inherits and that the model
-    // cannot narrow. The actually-enforced policy is always at least this
-    // permissive, so a request asking for something *more* restrictive would be
-    // silently widened to the floor and mislead the model about its real access.
-    // Reject such requests with an explanation instead of running them.
+    // Standing permissions from settings, this thread, or the Session workspace
+    // that every command inherits and that the model cannot narrow. The
+    // actually-enforced policy is always at least this permissive, so a request
+    // asking for something more restrictive would be silently widened to the
+    // floor and mislead the model about its real access. Reject such requests
+    // with an explanation instead of running them.
     let floor = event_stream
         .effective_sandbox_request(&crate::sandboxing::SandboxRequest::default(), &persistent);
     let unsandboxed_floor = sandboxing
@@ -529,6 +570,7 @@ async fn run_terminal_tool(
     } else {
         NetworkRequest::None
     };
+    let network = network_request_without_session_hosts(network, &session_hosts);
 
     // Host-specific network access is enforced by a loopback proxy that
     // confines the sandbox to its port. A non-local project's terminal can't
@@ -728,7 +770,8 @@ async fn run_terminal_tool(
             sandbox_not_applied = Some(acp_thread::SandboxNotAppliedReason::DisabledForThisThread);
             None
         } else {
-            let effective = event_stream.effective_sandbox_request(&request, &persistent);
+            let mut effective = event_stream.effective_sandbox_request(&request, &persistent);
+            effective.network = merge_session_hosts_into_network(effective.network, &session_hosts);
             if !can_restrict_to_hosts && matches!(effective.network, NetworkRequest::Hosts(_)) {
                 return Err(
                     "This platform or project has a saved host-specific network grant, but cannot enforce host-specific sandboxed network access. Request `allow_all_hosts: true` if the command needs network access."
@@ -1187,6 +1230,47 @@ fn build_network_request(sandbox: &TerminalSandboxInput) -> Result<NetworkReques
     Ok(NetworkRequest::Hosts(patterns))
 }
 
+fn network_request_without_session_hosts(
+    network: NetworkRequest,
+    session_hosts: &[HostPattern],
+) -> NetworkRequest {
+    match network {
+        NetworkRequest::Hosts(hosts) => {
+            let remaining_hosts = hosts
+                .into_iter()
+                .filter(|requested| {
+                    !session_hosts
+                        .iter()
+                        .any(|session_host| session_host.covers(requested))
+                })
+                .collect::<Vec<_>>();
+            if remaining_hosts.is_empty() {
+                NetworkRequest::None
+            } else {
+                NetworkRequest::Hosts(remaining_hosts)
+            }
+        }
+        network => network,
+    }
+}
+
+fn merge_session_hosts_into_network(
+    network: NetworkRequest,
+    session_hosts: &[HostPattern],
+) -> NetworkRequest {
+    match network {
+        NetworkRequest::AnyHost => NetworkRequest::AnyHost,
+        NetworkRequest::None if session_hosts.is_empty() => NetworkRequest::None,
+        NetworkRequest::None => NetworkRequest::Hosts(session_hosts.to_vec()),
+        NetworkRequest::Hosts(mut hosts) => {
+            for session_host in session_hosts {
+                insert_host_pattern(&mut hosts, session_host.clone());
+            }
+            NetworkRequest::Hosts(hosts)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct TerminalOutputSelection {
     head_lines: Option<usize>,
@@ -1421,6 +1505,43 @@ fn resolve_cd_in_worktrees(
 mod tests {
     use super::*;
     use util::paths::PathStyle::{Unix, Windows};
+
+    #[test]
+    fn session_sandbox_network_hosts_are_merged_without_escalation() {
+        let github = HostPattern::parse("github.com").unwrap();
+        let proxy = HostPattern::parse("proxy.example").unwrap();
+        let session_hosts = vec![github.clone(), proxy.clone()];
+
+        assert_eq!(
+            network_request_without_session_hosts(
+                NetworkRequest::Hosts(vec![github.clone(), proxy]),
+                &session_hosts,
+            ),
+            NetworkRequest::None
+        );
+        assert_eq!(
+            network_request_without_session_hosts(
+                NetworkRequest::Hosts(vec![
+                    github.clone(),
+                    HostPattern::parse("crates.io").unwrap(),
+                ]),
+                &session_hosts,
+            ),
+            NetworkRequest::Hosts(vec![HostPattern::parse("crates.io").unwrap()])
+        );
+        assert_eq!(
+            merge_session_hosts_into_network(NetworkRequest::None, &session_hosts),
+            NetworkRequest::Hosts(session_hosts.clone())
+        );
+        assert_eq!(
+            merge_session_hosts_into_network(NetworkRequest::Hosts(vec![github]), &session_hosts,),
+            NetworkRequest::Hosts(session_hosts.clone())
+        );
+        assert_eq!(
+            merge_session_hosts_into_network(NetworkRequest::AnyHost, &session_hosts),
+            NetworkRequest::AnyHost
+        );
+    }
 
     #[test]
     fn test_resolve_cd_uses_project_path_style() {

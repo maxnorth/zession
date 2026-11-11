@@ -4,6 +4,7 @@ mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 mod sandboxing;
+mod session_sandbox;
 mod templates;
 #[cfg(test)]
 mod tests;
