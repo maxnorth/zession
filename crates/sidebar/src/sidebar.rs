@@ -69,6 +69,7 @@ use workspace::{
     ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
     ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
 };
+use zession::SessionStore;
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
 use zed_actions::editor::{MoveDown, MoveUp};
@@ -787,6 +788,7 @@ fn create_worktree_in_workspace(
 /// be computed from the current world state, compute it in the rebuild.
 pub struct Sidebar {
     multi_workspace: WeakEntity<MultiWorkspace>,
+    last_session_keys: Vec<ProjectGroupKey>,
     width: Pixels,
     /// Whether `width` came from the user rather than from
     /// `agent.threads_sidebar.default_width`. Only a user-chosen width is persisted, so
@@ -876,7 +878,7 @@ impl Sidebar {
 
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search threads…", window, cx);
+            editor.set_placeholder_text("Search sessions…", window, cx);
             editor
         });
         let rename_editor = cx.new(|cx| Editor::single_line(window, cx));
@@ -935,6 +937,54 @@ impl Sidebar {
         )
         .detach();
 
+        let session_store = SessionStore::try_global(cx);
+        let last_session_keys = session_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .read(cx)
+                    .sessions()
+                    .iter()
+                    .map(SessionStore::group_key)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !last_session_keys.is_empty() {
+            multi_workspace
+                .update(cx, |multi_workspace, cx| {
+                    multi_workspace.sync_session_groups(&last_session_keys, &[], cx);
+                });
+        }
+        if let Some(session_store) = session_store {
+            cx.observe(&session_store, |this, session_store, cx| {
+                let session_keys = session_store
+                    .read(cx)
+                    .sessions()
+                    .iter()
+                    .map(SessionStore::group_key)
+                    .collect::<Vec<_>>();
+                let removed_keys = this
+                    .last_session_keys
+                    .iter()
+                    .filter(|key| !session_keys.contains(key))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                this.last_session_keys = session_keys.clone();
+                if let Some(multi_workspace) = this.multi_workspace.upgrade() {
+                    multi_workspace
+                        .update(cx, |multi_workspace, cx| {
+                            multi_workspace.sync_session_groups(
+                                &session_keys,
+                                &removed_keys,
+                                cx,
+                            );
+                        });
+                }
+                this.schedule_update_entries(false, cx);
+            })
+            .detach();
+        }
+
         let channels_with_threads = channels_with_threads(cx);
         cx.spawn(async move |this, cx| {
             let channels = channels_with_threads.await;
@@ -959,6 +1009,7 @@ impl Sidebar {
 
         Self {
             multi_workspace: multi_workspace.downgrade(),
+            last_session_keys,
             width: AgentSettings::get_global(cx).threads_sidebar.default_width,
             width_set_by_user: false,
             focus_handle,
@@ -1610,7 +1661,19 @@ impl Sidebar {
                 continue;
             }
 
-            let label = group_key.display_name(&path_detail_map);
+            let session_title = if group_key.path_list().paths().len() == 1 {
+                SessionStore::try_global(cx).and_then(|store| {
+                    let directory = group_key.path_list().paths().first()?;
+                    store
+                        .read(cx)
+                        .session_for_dir(directory)
+                        .map(|session| session.display_title())
+                })
+            } else {
+                None
+            };
+            let label =
+                session_title.unwrap_or_else(|| group_key.display_name(&path_detail_map));
 
             let is_collapsed = self.is_group_collapsed(group_key, cx);
             let should_load_threads = !is_collapsed || !query.is_empty();
@@ -2877,6 +2940,17 @@ impl Sidebar {
     ) -> AnyElement {
         let multi_workspace = self.multi_workspace.clone();
         let project_group_key = project_group_key.clone();
+        let session_directory = if project_group_key.path_list().paths().len() == 1 {
+            SessionStore::try_global(cx).and_then(|store| {
+                let directory = project_group_key.path_list().paths().first()?;
+                store
+                    .read(cx)
+                    .session_for_dir(directory)
+                    .map(|session| session.dir.clone())
+            })
+        } else {
+            None
+        };
 
         let show_multi_project_entries = multi_workspace
             .read_with(cx, |mw, _| {
@@ -2921,6 +2995,7 @@ impl Sidebar {
             .menu(move |window, cx| {
                 let multi_workspace = multi_workspace.clone();
                 let project_group_key = project_group_key.clone();
+                let session_directory = session_directory.clone();
                 let this_for_menu = this.clone();
 
                 let open_workspaces = multi_workspace
@@ -3202,6 +3277,31 @@ impl Sidebar {
 
                         let project_group_key = project_group_key.clone();
                         let remove_multi_workspace = multi_workspace.clone();
+                        let menu = if let Some(session_directory) = session_directory.as_ref() {
+                            let attach_session_directory = session_directory.clone();
+                            let attach_weak_menu = weak_menu.clone();
+                            menu.entry(
+                                "Attach Repository…",
+                                Some(Box::new(zession::AttachRepository {
+                                    session_dir: Some(session_directory.clone()),
+                                })),
+                                move |window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(zession::AttachRepository {
+                                            session_dir: Some(
+                                                attach_session_directory.clone(),
+                                            ),
+                                        }),
+                                        cx,
+                                    );
+                                    attach_weak_menu
+                                        .update(cx, |_, cx| cx.emit(DismissEvent))
+                                        .ok();
+                                },
+                            )
+                        } else {
+                            menu
+                        };
                         menu.separator().entry("Remove", None, move |window, cx| {
                             remove_multi_workspace
                                 .update(cx, |multi_workspace, cx| {
@@ -7554,6 +7654,16 @@ impl Sidebar {
                     })),
             )
             .child(div().flex_1())
+            .child(
+                IconButton::new("new-session", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(|_, cx| {
+                        Tooltip::for_action("New Session", &zession::NewSession, cx)
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(zession::NewSession), cx);
+                    }),
+            )
             .child(self.render_recent_projects_button(cx))
     }
 

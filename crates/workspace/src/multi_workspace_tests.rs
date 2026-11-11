@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::item::test::TestItem;
@@ -115,6 +115,92 @@ async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContex
             "Sidebar should open when toggled after re-enabling AI"
         );
     });
+}
+
+#[gpui::test]
+async fn test_session_groups_are_ordered_before_other_groups(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/base", json!({})).await;
+    let project = Project::test(fs, [Path::new("/base")], cx).await;
+    let (multi_workspace, cx) = setup_multi_workspace(&[project], cx);
+
+    let other_first = ProjectGroupKey::new(
+        None,
+        util::path_list::PathList::new(&[PathBuf::from("/other-first")]),
+    );
+    let other_second = ProjectGroupKey::new(
+        None,
+        util::path_list::PathList::new(&[PathBuf::from("/other-second")]),
+    );
+    let session_first = ProjectGroupKey::new(
+        None,
+        util::path_list::PathList::new(&[PathBuf::from("/sessions/first")]),
+    );
+    let session_second = ProjectGroupKey::new(
+        None,
+        util::path_list::PathList::new(&[PathBuf::from("/sessions/second")]),
+    );
+
+    multi_workspace.update(cx, |multi_workspace, _| {
+        multi_workspace.test_add_project_group(ProjectGroup {
+            key: other_first.clone(),
+            workspaces: Vec::new(),
+            expanded: false,
+        });
+        multi_workspace.test_add_project_group(ProjectGroup {
+            key: other_second.clone(),
+            workspaces: Vec::new(),
+            expanded: true,
+        });
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.sync_session_groups(
+            &[session_first.clone(), session_second.clone()],
+            &[],
+            cx,
+        );
+    });
+
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            multi_workspace.project_group_keys()
+        }),
+        vec![
+            session_first,
+            session_second,
+            ProjectGroupKey::new(
+                None,
+                util::path_list::PathList::new(&[PathBuf::from("/base")]),
+            ),
+            other_first,
+            other_second,
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_session_group_is_retained_while_workspace_is_held(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/sessions/held", json!({})).await;
+    let project = Project::test(fs, [Path::new("/sessions/held")], cx).await;
+    let (multi_workspace, cx) = setup_multi_workspace(&[project], cx);
+    let session_key = ProjectGroupKey::new(
+        None,
+        util::path_list::PathList::new(&[PathBuf::from("/sessions/held")]),
+    );
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.sync_session_groups(&[], std::slice::from_ref(&session_key), cx);
+    });
+
+    assert!(
+        multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace
+                .project_group_keys()
+                .contains(&session_key))
+    );
 }
 
 #[gpui::test]

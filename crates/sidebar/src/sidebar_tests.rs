@@ -25,6 +25,7 @@ use std::{
     sync::Arc,
 };
 use util::{path_list::PathList, rel_path::rel_path};
+use zession::SessionStore;
 
 fn use_unique_metadata_databases(cx: &mut TestAppContext) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -308,6 +309,114 @@ fn setup_sidebar_closed(
     });
     cx.run_until_parked();
     sidebar
+}
+
+async fn session_test_project(
+    id: &str,
+    title: Option<&str>,
+    workspace_path: &str,
+    cx: &mut TestAppContext,
+) -> (Entity<SessionStore>, Entity<project::Project>) {
+    let fs = FakeFs::new(cx.executor());
+    let session_directory = format!("/sessions/{id}");
+    let manifest = match title {
+        Some(title) => {
+            format!(r#"{{"id":"{id}","title":"{title}","created":"2026-01-01T00:00:00Z"}}"#)
+        }
+        None => format!(r#"{{"id":"{id}","created":"2026-01-01T00:00:00Z"}}"#),
+    };
+    fs.insert_tree(
+        &session_directory,
+        serde_json::json!({"session.json": manifest}),
+    )
+    .await;
+    if workspace_path != session_directory {
+        fs.insert_tree(workspace_path, serde_json::json!({})).await;
+    }
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+    let session_store = cx.new({
+        let fs = fs.clone();
+        move |cx| SessionStore::new(fs, PathBuf::from("/sessions"), cx)
+    });
+    cx.update(|cx| SessionStore::set_global(session_store.clone(), cx));
+    cx.run_until_parked();
+    let project = project::Project::test(fs, [Path::new(workspace_path)], cx).await;
+
+    (session_store, project)
+}
+
+#[gpui::test]
+async fn test_session_only_header_uses_manifest_title(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (session_store, project) =
+        session_test_project("demo-a", Some("Demo Alpha"), "/ordinary-project", cx).await;
+    let session = session_store
+        .read_with(cx, |store, _| store.sessions().first().cloned())
+        .expect("session manifest loaded");
+    let session_key = SessionStore::group_key(&session);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    assert!(
+        visible_entries_as_strings(&sidebar, cx)
+            .iter()
+            .any(|entry| entry.contains("[Demo Alpha]"))
+    );
+    assert!(
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace
+                .project_groups(cx)
+                .into_iter()
+                .find(|group| group.key == session_key)
+                .is_some_and(|group| group.workspaces.is_empty())
+        }),
+        "session headers should remain visible without an open workspace"
+    );
+}
+
+#[gpui::test]
+async fn test_open_session_workspace_uses_manifest_title(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (session_store, project) =
+        session_test_project("demo-a", Some("Demo Alpha"), "/sessions/demo-a", cx).await;
+    let session = session_store
+        .read_with(cx, |store, _| store.sessions().first().cloned())
+        .expect("session manifest loaded");
+    let session_key = SessionStore::group_key(&session);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let entries = visible_entries_as_strings(&sidebar, cx);
+
+    assert!(entries.iter().any(|entry| entry.contains("[Demo Alpha]")));
+    assert!(!entries.iter().any(|entry| entry.contains("[demo-a]")));
+    assert!(
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace
+                .project_groups(cx)
+                .into_iter()
+                .find(|group| group.key == session_key)
+                .is_some_and(|group| group.workspaces.len() == 1)
+        }),
+        "the open session workspace should use its session group"
+    );
+}
+
+#[gpui::test]
+async fn test_session_header_falls_back_to_id_without_title(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (_session_store, project) =
+        session_test_project("untitled-session", None, "/sessions/untitled-session", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    assert!(
+        visible_entries_as_strings(&sidebar, cx)
+            .iter()
+            .any(|entry| entry.contains("[untitled-session]"))
+    );
 }
 
 fn set_threads_sidebar_default_width(width: f32, cx: &mut App) {
@@ -761,9 +870,7 @@ async fn test_sidebar_action_hover_contrasts_with_row(cx: &mut TestAppContext) {
                 hover
             );
         }
-        for selector in ["ICON-Plus", "ICON-Ellipsis"] {
-            assert_sidebar_action_hover(selector, row_bounds, cx);
-        }
+        assert_sidebar_action_hover("ICON-Ellipsis", row_bounds, cx);
         if query.is_empty() {
             let thread_bounds = sidebar.read_with(cx, |sidebar, _| {
                 sidebar

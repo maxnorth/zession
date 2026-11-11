@@ -16626,6 +16626,7 @@ dependencies = [
  "util",
  "workspace",
  "zed_actions",
+ "zession",
 ]
 
 [[package]]
@@ -22592,6 +22593,7 @@ dependencies = [
  "zed_actions",
  "zed_credentials_provider",
  "zed_env_vars",
+ "zession",
  "zlog",
  "zlog_settings",
  "ztracing",
@@ -22912,6 +22914,30 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "zession"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fs",
+ "futures 0.3.34",
+ "fuzzy_nucleo",
+ "gpui",
+ "log",
+ "paths",
+ "picker",
+ "pretty_assertions",
+ "project",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "smol",
+ "ui",
+ "util",
+ "workspace",
 ]
 
 [[package]]

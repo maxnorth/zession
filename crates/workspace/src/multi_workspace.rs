@@ -847,6 +847,64 @@ impl MultiWorkspace {
             .collect()
     }
 
+    pub fn sync_session_groups(
+        &mut self,
+        session_keys: &[ProjectGroupKey],
+        removed_keys: &[ProjectGroupKey],
+        cx: &mut Context<Self>,
+    ) {
+        let previous_keys = self.project_group_keys();
+
+        for key in session_keys {
+            if !self.project_groups.iter().any(|group| group.key == *key) {
+                self.project_groups.push(ProjectGroupState {
+                    key: key.clone(),
+                    expanded: true,
+                });
+            }
+        }
+
+        for key in removed_keys {
+            if session_keys.contains(key) {
+                continue;
+            }
+            let held_workspace_uses_key = self
+                .held
+                .iter()
+                .any(|held| held.workspace.read(cx).project_group_key(cx) == *key);
+            if !held_workspace_uses_key {
+                self.project_groups.retain(|group| group.key != *key);
+            }
+        }
+
+        let mut ordered_session_groups = Vec::new();
+        let mut other_groups = Vec::new();
+        for group in self.project_groups.drain(..) {
+            if let Some(index) = session_keys.iter().position(|key| *key == group.key) {
+                ordered_session_groups.push((index, group));
+            } else {
+                other_groups.push(group);
+            }
+        }
+        ordered_session_groups.sort_by_key(|(index, _)| *index);
+        self.project_groups = ordered_session_groups
+            .into_iter()
+            .map(|(_, group)| group)
+            .chain(other_groups)
+            .collect();
+
+        let changed = previous_keys.len() != self.project_groups.len()
+            || previous_keys
+                .iter()
+                .zip(&self.project_groups)
+                .any(|(previous, current)| previous != &current.key);
+        if changed {
+            cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+            self.serialize(cx);
+            cx.notify();
+        }
+    }
+
     pub fn project_groups(&self, cx: &App) -> Vec<ProjectGroup> {
         self.project_groups
             .iter()
