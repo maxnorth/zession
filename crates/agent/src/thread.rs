@@ -3,9 +3,10 @@ use crate::{
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SessionAttachRepoTool,
+    SessionDiscoverReposTool, SessionReadRepoTool, SessionStatusTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    WriteFileTool, decide_permission_from_settings, session_workspace_for_roots,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri, ProcessOutput};
 use action_log::ActionLog;
@@ -2239,6 +2240,21 @@ impl Thread {
         let update_agent_location = self.parent_thread_id().is_none();
 
         let language_registry = self.project.read(cx).languages().clone();
+        let session_workspace = {
+            let project = self.project.read(cx);
+            if project.is_local() {
+                let worktree_roots = project
+                    .worktrees(cx)
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                    .collect::<Vec<_>>();
+                session_workspace_for_roots(
+                    &crate::session_sandbox::session_home(),
+                    &worktree_roots,
+                )
+            } else {
+                None
+            }
+        };
         self.add_tool(CopyPathTool::new(self.project.clone()));
         self.add_tool(CreateDirectoryTool::new(self.project.clone()));
         self.add_tool(DeletePathTool::new(
@@ -2267,6 +2283,12 @@ impl Thread {
             self.action_log.clone(),
             update_agent_location,
         ));
+        if let Some(workspace) = session_workspace {
+            self.add_tool(SessionDiscoverReposTool::new(workspace.clone()));
+            self.add_tool(SessionReadRepoTool::new(workspace.clone()));
+            self.add_tool(SessionAttachRepoTool::new(workspace.clone()));
+            self.add_tool(SessionStatusTool::new(workspace));
+        }
         // Register terminal tool variants; `enabled_tools` exposes the one
         // matching the current sandbox state to the model as `terminal`.
         self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));

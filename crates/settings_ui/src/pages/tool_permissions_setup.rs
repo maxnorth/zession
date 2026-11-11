@@ -69,6 +69,12 @@ const TOOLS: &[ToolInfo] = &[
         regex_explanation: "Patterns are matched against the URL being fetched.",
     },
     ToolInfo {
+        id: "session_attach_repo",
+        name: "Attach Session Repository",
+        description: "Repository attachments through Session",
+        regex_explanation: "Patterns are matched against the `session repos add` arguments.",
+    },
+    ToolInfo {
         id: "search_web",
         name: "Web Search",
         description: "Web search queries",
@@ -1404,6 +1410,9 @@ mod tests {
         const EXCLUDED_TOOLS: &[&str] = &[
             // Read-only / low-risk tools that don't call decide_permission_from_settings
             "apply_code_action",
+            "session_discover_repos",
+            "session_read_repo",
+            "session_status",
             // Interactive prompt: always asks the user via prompt_for_decision,
             // so it has no settings-driven permission rules.
             "ask_user",

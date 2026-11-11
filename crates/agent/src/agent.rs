@@ -28,6 +28,7 @@ pub use templates::*;
 pub use thread::*;
 pub use thread_store::*;
 pub use tool_permissions::*;
+pub(crate) use tools::session_workspace_for_roots;
 pub use tools::*;
 
 use acp_thread::{
