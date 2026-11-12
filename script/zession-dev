@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Build Zession, quit any running Zession instance, and launch the new build.
+#
+# Usage: script/zession-dev [--release] [-- <zed args>...]
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+profile=debug
+cargo_flags=()
+zed_args=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release) profile=release; cargo_flags+=(--release); shift ;;
+        -h|--help) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --) shift; zed_args=("$@"); break ;;
+        *) echo "unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+cd "$repo_root"
+echo "==> Building Zession ($profile)"
+cargo build ${cargo_flags[@]+"${cargo_flags[@]}"} -p zed
+
+binary="$repo_root/target/$profile/zed"
+# Dev builds share one single-instance socket, so every running dev build
+# (source builds and "Zed Dev.app") must exit or the new one hands off to it.
+pattern='(^|/)target/(debug|release)/zed( |$)|Zed Dev\.app/Contents/MacOS/zed( |$)'
+
+running() { pgrep -f -- "$pattern" || true; }
+
+if [[ -n "$(running)" ]]; then
+    echo "==> Quitting running Zession"
+    if [[ "$(uname)" == Darwin ]]; then
+        osascript -e 'tell application "Zed Dev" to quit' >/dev/null 2>&1 || true
+    fi
+    pkill -TERM -f -- "$pattern" || true
+    for _ in $(seq 1 50); do
+        [[ -z "$(running)" ]] && break
+        sleep 0.1
+    done
+    if [[ -n "$(running)" ]]; then
+        echo "    still running after 5s, killing"
+        pkill -KILL -f -- "$pattern" || true
+        sleep 0.5
+    fi
+fi
+
+log="${TMPDIR:-/tmp}/zession-dev.log"
+echo "==> Launching $binary (log: $log)"
+nohup "$binary" ${zed_args[@]+"${zed_args[@]}"} >"$log" 2>&1 &
+disown
