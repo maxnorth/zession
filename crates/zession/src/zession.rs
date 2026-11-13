@@ -148,80 +148,101 @@ impl SessionStore {
 pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
     SessionStore::init(fs, cx);
 
-    cx.on_action(|_: &NewSession, cx| {
-        let Some(multi_workspace) = cx
-            .active_window()
-            .and_then(|window| window.downcast::<MultiWorkspace>())
-        else {
-            return;
-        };
-        let Some(active_workspace) = multi_workspace
-            .read(cx)
-            .ok()
-            .map(|multi_workspace| multi_workspace.workspace().downgrade())
-        else {
-            return;
-        };
-        let create_session = cx.background_spawn(async { zession_core::create_session(None) });
-        cx.spawn(async move |cx| match create_session.await {
-            Ok(session) => {
-                let session_directory = session.dir;
-                let path_list = PathList::new(std::slice::from_ref(&session_directory));
-                let project_group = ProjectGroupKey::new(None, path_list.clone());
-                if let Err(error) = multi_workspace.update(cx, |multi_workspace, window, cx| {
-                    multi_workspace
-                        .find_or_create_local_workspace(
-                            path_list,
-                            Some(project_group),
-                            None,
-                            OpenMode::Activate,
-                            None,
-                            window,
+    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+        workspace
+            .register_action(|_workspace, _: &NewSession, window, cx| {
+                let Some(multi_workspace) =
+                    window.window_handle().downcast::<MultiWorkspace>()
+                else {
+                    log::error!("Cannot create Session: window root is not a MultiWorkspace");
+                    return;
+                };
+                let active_workspace = cx.weak_entity();
+                let create_session =
+                    cx.background_spawn(async { zession_core::create_session(None) });
+                cx.spawn(async move |_, cx| match create_session.await {
+                    Ok(session) => {
+                        let session_directory = session.dir;
+                        let path_list = PathList::new(std::slice::from_ref(&session_directory));
+                        let project_group = ProjectGroupKey::new(None, path_list.clone());
+                        if let Err(error) =
+                            multi_workspace.update(cx, |multi_workspace, window, cx| {
+                                multi_workspace
+                                    .find_or_create_local_workspace(
+                                        path_list,
+                                        Some(project_group),
+                                        None,
+                                        OpenMode::Activate,
+                                        None,
+                                        window,
+                                        cx,
+                                    )
+                                    .detach_and_log_err(cx);
+                            })
+                        {
+                            log::error!("Failed to open new Session workspace: {error:#}");
+                            show_session_error(
+                                active_workspace,
+                                format!("Failed to open new Session workspace: {error:#}"),
+                                cx,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("Failed to create Session: {error:#}");
+                        show_session_error(
+                            active_workspace,
+                            format!("Failed to create Session: {error:#}"),
                             cx,
-                        )
-                        .detach_and_log_err(cx);
-                }) {
-                    log::debug!("Failed to open new session workspace: {error:#}");
-                }
-            }
-            Err(error) => {
-                show_session_error(
-                    active_workspace,
-                    format!("Failed to create Session: {error:#}"),
-                    cx,
-                );
-            }
-        })
-        .detach();
-    });
-
-    cx.on_action(|action: &AttachRepository, cx| {
-        let Some(multi_workspace) = cx
-            .active_window()
-            .and_then(|window| window.downcast::<MultiWorkspace>())
-        else {
-            return;
-        };
-        let session_directory = action.session_dir.clone();
-        let Some(session) = SessionStore::try_global(cx).and_then(|store| {
-            let store = store.read(cx);
-            let dir = session_directory.clone().or_else(|| {
-                multi_workspace
-                    .read(cx)
-                    .ok()?
-                    .workspace()
-                    .read(cx)
-                    .root_paths(cx)
-                    .into_iter()
-                    .next()
-                    .map(|path| path.to_path_buf())
-            })?;
-            store.session_for_dir(&dir).cloned()
-        }) else {
-            multi_workspace
-                .update(cx, |multi_workspace, _, cx| {
-                    let workspace = multi_workspace.workspace().clone();
-                    workspace.update(cx, |workspace, cx| {
+                        );
+                    }
+                })
+                .detach();
+            })
+            .register_action(
+                |workspace, action: &AttachRepository, window, cx| {
+                    let session_directory = action.session_dir.clone().or_else(|| {
+                        workspace
+                            .root_paths(cx)
+                            .into_iter()
+                            .next()
+                            .map(|path| path.to_path_buf())
+                    });
+                    let Some(session_directory) = session_directory else {
+                        log::error!(
+                            "Cannot attach repository: action has no session directory and the workspace has no root path"
+                        );
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<AttachRepository>(),
+                                "No Session directory found for this project",
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                        return;
+                    };
+                    let Some(store) = SessionStore::try_global(cx) else {
+                        log::error!("Cannot attach repository: SessionStore is not initialized");
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<AttachRepository>(),
+                                "Session store is not initialized",
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                        return;
+                    };
+                    let Some(session) = store
+                        .read(cx)
+                        .session_for_dir(&session_directory)
+                        .cloned()
+                    else {
+                        log::error!(
+                            "Cannot attach repository: no Session manifest found for {}",
+                            session_directory.display()
+                        );
                         workspace.show_toast(
                             Toast::new(
                                 NotificationId::unique::<AttachRepository>(),
@@ -230,35 +251,17 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
                             .autohide(),
                             cx,
                         );
-                    });
-                })
-                .log_err();
-            return;
-        };
+                        return;
+                    };
 
-        let fs = <dyn Fs>::global(cx);
-        let cache_root = zession_core::store_dir();
-        let settings = ZessionSettings::get_global(cx).clone();
-        let Some(weak_workspace) = multi_workspace
-            .read(cx)
-            .ok()
-            .map(|multi_workspace| multi_workspace.workspace().downgrade())
-        else {
-            return;
-        };
-        let Some(http_client) = multi_workspace.read(cx).ok().map(|multi_workspace| {
-            let project = multi_workspace.workspace().read(cx).project().clone();
-            project.read(cx).client().http_client()
-        }) else {
-            return;
-        };
-        let http_client: Arc<dyn HttpClient> = http_client;
-        multi_workspace
-            .update(cx, move |multi_workspace, window, cx| {
-                let active_workspace = multi_workspace.workspace().clone();
-                let weak_workspace = weak_workspace.clone();
-                active_workspace.update(cx, move |active_workspace, cx| {
-                    active_workspace.toggle_modal(window, cx, move |window, cx| {
+                    let fs = <dyn Fs>::global(cx);
+                    let cache_root = zession_core::store_dir();
+                    let settings = ZessionSettings::get_global(cx).clone();
+                    let weak_workspace = cx.weak_entity();
+                    let project = workspace.project().clone();
+                    let http_client: Arc<dyn HttpClient> =
+                        project.read(cx).client().http_client();
+                    workspace.toggle_modal(window, cx, move |window, cx| {
                         AttachRepositoryModal::new(
                             session,
                             weak_workspace,
@@ -270,10 +273,10 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
                             cx,
                         )
                     });
-                });
-            })
-            .log_err();
-    });
+                },
+            );
+    })
+    .detach();
 }
 
 fn show_session_error(workspace: gpui::WeakEntity<Workspace>, message: String, cx: &mut AsyncApp) {
