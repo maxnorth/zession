@@ -33,6 +33,8 @@ const OUTPUT_LIMIT: usize = 16 * 1024;
 const INDEX_FILE_LIMIT: usize = 8 * 1024;
 const INDEX_CONTEXT_LIMIT: usize = 80 * 1024;
 const INDEX_PATH_LIMIT: usize = 2000;
+const INDEX_FILE_LIST_HEADER: &str = "## File list\n";
+const INDEX_FILE_CONTENTS_HEADER: &str = "\n\n## Selected file contents\n";
 const READ_ONLY_PUSH_URL: &str = "DISABLED-by-session-read-only-policy";
 const INDEX_PROMPT: &str = "You are indexing a git repository for Zession, a tool that helps people find the right repositories for a task.\n\
 Repository: {repo} ({remote}), checked out read-only at commit {commit}.\n\n\
@@ -48,7 +50,7 @@ Write a detailed Markdown summary (roughly 600-1500 words, depending on the repo
 ## Development\nHow to build, run, and test it locally (commands), and any conventions in CONTRIBUTING, CLAUDE, or AGENTS files.\n\n\
 ## Keywords\nA comma-separated list of terms, including synonyms and product, service, and resource names, that someone might search for when they need this repo.\n\n\
 Only state what you saw in the files. Output only the Markdown summary, with no preamble.\n\n\
-Files below:\n";
+";
 
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct ZessionSettings {
@@ -1143,8 +1145,12 @@ pub async fn read_repo_at(
         false,
     )
     .await?;
+    let is_grep = matches!(&operation, RepoOperation::Grep { .. });
     let arguments = read_repo_git_args(operation)?;
     let output = run_git(Some(&store.cache), arguments).await?;
+    if is_grep && output.status.code() == Some(1) && output.stdout.is_empty() {
+        return Ok("No matches.".to_string());
+    }
     if !output.status.success() {
         return Err(git_error(output, "read repository"));
     }
@@ -1178,7 +1184,15 @@ fn read_repo_git_args(operation: RepoOperation) -> Result<Vec<String>> {
                 "pattern must be non-empty and must not start with '-'"
             );
             let git_ref = validate_git_ref(git_ref.as_deref())?;
-            arguments.extend(["grep".into(), "-n".into(), "-e".into(), pattern, git_ref]);
+            arguments.extend([
+                "grep".into(),
+                "-n".into(),
+                "-I".into(),
+                "-E".into(),
+                "-e".into(),
+                pattern,
+                git_ref,
+            ]);
             if let Some(path) = path.as_deref() {
                 arguments.extend(["--".into(), validate_path(path)?]);
             }
@@ -1543,12 +1557,14 @@ pub async fn index_repo_at(
         return Ok(index_path);
     }
 
-    let files = gather_index_context(store_repo, &commit).await?;
+    let context = gather_index_context(store_repo, &commit).await?;
     let mut prompt = INDEX_PROMPT
         .replace("{repo}", &store_repo.repo_id)
         .replace("{remote}", &store_repo.remote)
         .replace("{commit}", &commit);
-    for file in files {
+    prompt.push_str(&context.file_list);
+    prompt.push_str(INDEX_FILE_CONTENTS_HEADER);
+    for file in context.files {
         prompt.push_str("\n--- ");
         prompt.push_str(&file.path);
         prompt.push_str(" ---\n");
@@ -1609,10 +1625,14 @@ pub struct IndexContextFile {
     pub contents: String,
 }
 
-pub async fn gather_index_context(
-    store_repo: &StoreRepo,
-    commit: &str,
-) -> Result<Vec<IndexContextFile>> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexContext {
+    pub file_list: String,
+    pub files: Vec<IndexContextFile>,
+    pub total_bytes: usize,
+}
+
+pub async fn gather_index_context(store_repo: &StoreRepo, commit: &str) -> Result<IndexContext> {
     let output = run_git(
         Some(&store_repo.cache),
         ["ls-tree", "-r", "--name-only", commit],
@@ -1620,16 +1640,21 @@ pub async fn gather_index_context(
     .await?;
     let paths_output = String::from_utf8_lossy(&output.stdout).into_owned();
     ensure_git_success(output, "list repository files for indexing")?;
-    let paths = paths_output
-        .lines()
+    let all_paths = paths_output.lines().collect::<Vec<_>>();
+    let path_limit_truncated = all_paths.len() > INDEX_PATH_LIMIT;
+    let paths = all_paths
+        .into_iter()
         .take(INDEX_PATH_LIMIT)
-        .filter(|path| should_index_path(path))
-        .map(str::to_owned)
         .collect::<Vec<_>>();
+    let (file_list, mut total_bytes) = build_index_file_list(&paths, path_limit_truncated);
     let mut files = Vec::new();
-    let mut total_bytes = 0;
-    for path in paths {
-        if total_bytes >= INDEX_CONTEXT_LIMIT {
+    for path in paths.into_iter().filter(|path| should_index_path(path)) {
+        let path = path.to_owned();
+        let file_header_bytes = "\n--- ".len() + path.len() + " ---\n".len();
+        let file_suffix_bytes = 1;
+        let content_limit =
+            INDEX_CONTEXT_LIMIT.saturating_sub(total_bytes + file_header_bytes + file_suffix_bytes);
+        if content_limit == 0 {
             break;
         }
         let output = run_git(
@@ -1641,14 +1666,67 @@ pub async fn gather_index_context(
             log::debug!("could not read index context file {path}");
             continue;
         }
-        let remaining = INDEX_CONTEXT_LIMIT.saturating_sub(total_bytes);
-        let cap = INDEX_FILE_LIMIT.min(remaining);
+        let cap = INDEX_FILE_LIMIT.min(content_limit);
         let bytes = &output.stdout[..output.stdout.len().min(cap)];
-        let contents = String::from_utf8_lossy(bytes).into_owned();
-        total_bytes += contents.len();
+        let lossy_contents = String::from_utf8_lossy(bytes);
+        let contents = truncate_to_bytes(&lossy_contents, cap).to_owned();
+        total_bytes += file_header_bytes + contents.len() + file_suffix_bytes;
         files.push(IndexContextFile { path, contents });
     }
-    Ok(files)
+    Ok(IndexContext {
+        file_list,
+        files,
+        total_bytes,
+    })
+}
+
+fn build_index_file_list(paths: &[&str], path_limit_truncated: bool) -> (String, usize) {
+    let path_limit_notice = if path_limit_truncated {
+        format!(
+            "\n[File list truncated at the path limit; showing the first {INDEX_PATH_LIMIT} paths.]"
+        )
+    } else {
+        String::new()
+    };
+    let joined_paths = paths.join("\n");
+    let complete_file_list = format!("{INDEX_FILE_LIST_HEADER}{joined_paths}{path_limit_notice}");
+    let complete_context_bytes = complete_file_list.len() + INDEX_FILE_CONTENTS_HEADER.len();
+    if complete_context_bytes <= INDEX_CONTEXT_LIMIT {
+        return (complete_file_list, complete_context_bytes);
+    }
+
+    let context_limit_notice =
+        format!("\n[File list truncated to fit the {INDEX_CONTEXT_LIMIT}-byte context limit.]");
+    let fixed_bytes = INDEX_FILE_LIST_HEADER.len()
+        + path_limit_notice.len()
+        + context_limit_notice.len()
+        + INDEX_FILE_CONTENTS_HEADER.len();
+    let path_bytes_limit = INDEX_CONTEXT_LIMIT.saturating_sub(fixed_bytes);
+    let mut truncated_paths = String::new();
+    for path in paths {
+        let separator_bytes = usize::from(!truncated_paths.is_empty());
+        if truncated_paths.len() + separator_bytes + path.len() > path_bytes_limit {
+            break;
+        }
+        if separator_bytes > 0 {
+            truncated_paths.push('\n');
+        }
+        truncated_paths.push_str(path);
+    }
+
+    let file_list = format!(
+        "{INDEX_FILE_LIST_HEADER}{truncated_paths}{path_limit_notice}{context_limit_notice}"
+    );
+    let total_bytes = file_list.len() + INDEX_FILE_CONTENTS_HEADER.len();
+    (file_list, total_bytes)
+}
+
+fn truncate_to_bytes(contents: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(contents.len());
+    while !contents.is_char_boundary(end) {
+        end -= 1;
+    }
+    &contents[..end]
 }
 
 fn should_index_path(path: &str) -> bool {
@@ -2320,7 +2398,7 @@ mod tests {
             &home,
             "local/read-project",
             RepoOperation::Grep {
-                pattern: "needle-value".into(),
+                pattern: "needle-value|package".into(),
                 git_ref: None,
                 path: None,
             },
@@ -2328,7 +2406,21 @@ mod tests {
         )
         .await
         .expect("grep repository");
-        assert!(matches.contains("main.go"));
+        assert!(matches.contains("package main"));
+        assert!(matches.contains("needle-value"));
+        let no_matches = read_repo_at(
+            &home,
+            "local/read-project",
+            RepoOperation::Grep {
+                pattern: "no-such-pattern".into(),
+                git_ref: None,
+                path: None,
+            },
+            &settings,
+        )
+        .await
+        .expect("grep with no matches");
+        assert_eq!(no_matches, "No matches.");
         let log = read_repo_at(
             &home,
             "local/read-project",
@@ -2341,6 +2433,17 @@ mod tests {
         .await
         .expect("read repository log");
         assert!(log.contains("base commit"));
+
+        let grep_arguments = read_repo_git_args(RepoOperation::Grep {
+            pattern: "a|b".into(),
+            git_ref: None,
+            path: None,
+        })
+        .expect("build grep arguments");
+        assert_eq!(
+            grep_arguments,
+            ["grep", "-n", "-I", "-E", "-e", "a|b", "HEAD"]
+        );
 
         assert!(
             read_repo_git_args(RepoOperation::Show {
@@ -2461,16 +2564,36 @@ mod tests {
             .expect("gather index context");
         assert!(
             context
+                .files
                 .iter()
                 .all(|file| file.contents.len() <= INDEX_FILE_LIMIT)
         );
-        assert!(
-            context
-                .iter()
-                .map(|file| file.contents.len())
-                .sum::<usize>()
-                <= INDEX_CONTEXT_LIMIT
-        );
+        assert!(context.total_bytes <= INDEX_CONTEXT_LIMIT);
+    }
+
+    #[test]
+    fn index_file_list_notes_path_and_byte_truncation() {
+        let paths = (0..=INDEX_PATH_LIMIT)
+            .map(|index| format!("src/{index:04}.rs"))
+            .collect::<Vec<_>>();
+        let path_references = paths
+            .iter()
+            .take(INDEX_PATH_LIMIT)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let (file_list, total_bytes) = build_index_file_list(&path_references, true);
+        assert!(file_list.contains(&format!(
+            "File list truncated at the path limit; showing the first {INDEX_PATH_LIMIT} paths"
+        )));
+        assert!(file_list.contains("src/1999.rs"));
+        assert!(!file_list.contains("src/2000.rs"));
+        assert!(total_bytes <= INDEX_CONTEXT_LIMIT);
+
+        let long_path = "x".repeat(INDEX_CONTEXT_LIMIT);
+        let (file_list, total_bytes) = build_index_file_list(&[&long_path], false);
+        assert!(file_list.contains("truncated to fit the 81920-byte context limit"));
+        assert!(!file_list.contains(&long_path));
+        assert!(total_bytes <= INDEX_CONTEXT_LIMIT);
     }
 
     #[gpui::test]
@@ -2481,7 +2604,14 @@ mod tests {
         let temporary_directory = tempfile::tempdir().expect("temporary directory");
         let home = temporary_directory.path().join(".zession");
         let repository_path = temporary_directory.path().join("index-project");
-        create_test_repository(&repository_path, &[("README.md", "a small repository")]).await;
+        create_test_repository(
+            &repository_path,
+            &[
+                ("README.md", "a small repository"),
+                ("src/lib.rs", "nested source is not selected"),
+            ],
+        )
+        .await;
         let spec = RepoSpec::parse_at(
             repository_path.to_str().expect("UTF-8 repository path"),
             &home,
@@ -2516,6 +2646,13 @@ mod tests {
                 .await;
         }
         let request = completion_request.expect("index completion request");
+        let prompt = request
+            .messages
+            .first()
+            .expect("index completion message")
+            .string_contents();
+        assert!(prompt.contains("## File list\nREADME.md\nsrc/lib.rs"));
+        assert!(!prompt.contains("\n--- src/lib.rs ---\n"));
         fake_provider.send_text(&model, &request, "## Purpose\nA fixture repository.");
         fake_provider.end_stream(&model, &request);
         let index_path = indexing_task.await.expect("index repository");
