@@ -323,6 +323,7 @@ dependencies = [
  "watch",
  "web_search",
  "zed_env_vars",
+ "zession_core",
  "zlog",
  "zstd",
 ]
@@ -16627,6 +16628,7 @@ dependencies = [
  "workspace",
  "zed_actions",
  "zession",
+ "zession_core",
 ]
 
 [[package]]
@@ -22594,6 +22596,7 @@ dependencies = [
  "zed_credentials_provider",
  "zed_env_vars",
  "zession",
+ "zession_core",
  "zlog",
  "zlog_settings",
  "ztracing",
@@ -22926,6 +22929,7 @@ dependencies = [
  "futures 0.3.34",
  "fuzzy_nucleo",
  "gpui",
+ "http_client",
  "log",
  "paths",
  "picker",
@@ -22934,10 +22938,39 @@ dependencies = [
  "schemars 1.0.4",
  "serde",
  "serde_json",
+ "settings",
  "smol",
  "ui",
  "util",
  "workspace",
+ "zession_core",
+]
+
+[[package]]
+name = "zession_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fs",
+ "futures 0.3.34",
+ "globset",
+ "gpui",
+ "http_client",
+ "language_model",
+ "log",
+ "parking_lot",
+ "paths",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "settings_content",
+ "smol",
+ "tempfile",
+ "thiserror 2.0.17",
+ "url",
+ "util",
 ]
 
 [[package]]

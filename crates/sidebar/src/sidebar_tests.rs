@@ -318,16 +318,21 @@ async fn session_test_project(
     cx: &mut TestAppContext,
 ) -> (Entity<SessionStore>, Entity<project::Project>) {
     let fs = FakeFs::new(cx.executor());
-    let session_directory = format!("/sessions/{id}");
+    let session_directory = format!("/zession/workspaces/{id}");
     let manifest = match title {
         Some(title) => {
-            format!(r#"{{"id":"{id}","title":"{title}","created":"2026-01-01T00:00:00Z"}}"#)
+            format!(
+                r#"{{"version":1,"id":"{id}","title":"{title}","created":"2026-01-01T00:00:00Z"}}"#
+            )
         }
-        None => format!(r#"{{"id":"{id}","created":"2026-01-01T00:00:00Z"}}"#),
+        None => format!(r#"{{"version":1,"id":"{id}","created":"2026-01-01T00:00:00Z"}}"#),
     };
     fs.insert_tree(
-        &session_directory,
-        serde_json::json!({"session.json": manifest}),
+        "/zession",
+        serde_json::json!({
+            "sessions": {(format!("{id}.json")): manifest},
+            "workspaces": {(id): {}}
+        }),
     )
     .await;
     if workspace_path != session_directory {
@@ -336,7 +341,7 @@ async fn session_test_project(
     cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
     let session_store = cx.new({
         let fs = fs.clone();
-        move |cx| SessionStore::new(fs, PathBuf::from("/sessions"), cx)
+        move |cx| SessionStore::new(fs, PathBuf::from("/zession/sessions"), cx)
     });
     cx.update(|cx| SessionStore::set_global(session_store.clone(), cx));
     cx.run_until_parked();
@@ -378,8 +383,13 @@ async fn test_session_only_header_uses_manifest_title(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_open_session_workspace_uses_manifest_title(cx: &mut TestAppContext) {
     init_test(cx);
-    let (session_store, project) =
-        session_test_project("demo-a", Some("Demo Alpha"), "/sessions/demo-a", cx).await;
+    let (session_store, project) = session_test_project(
+        "demo-a",
+        Some("Demo Alpha"),
+        "/zession/workspaces/demo-a",
+        cx,
+    )
+    .await;
     let session = session_store
         .read_with(cx, |store, _| store.sessions().first().cloned())
         .expect("session manifest loaded");
@@ -406,8 +416,13 @@ async fn test_open_session_workspace_uses_manifest_title(cx: &mut TestAppContext
 #[gpui::test]
 async fn test_session_header_falls_back_to_id_without_title(cx: &mut TestAppContext) {
     init_test(cx);
-    let (_session_store, project) =
-        session_test_project("untitled-session", None, "/sessions/untitled-session", cx).await;
+    let (_session_store, project) = session_test_project(
+        "untitled-session",
+        None,
+        "/zession/workspaces/untitled-session",
+        cx,
+    )
+    .await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let sidebar = setup_sidebar(&multi_workspace, cx);

@@ -4,7 +4,7 @@ use crate::{
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SessionAttachRepoTool,
-    SessionDiscoverReposTool, SessionReadRepoTool, SessionStatusTool, SpawnAgentTool,
+    SessionReadRepoTool, SessionSearchReposTool, SessionStatusTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
     WriteFileTool, decide_permission_from_settings, session_workspace_for_roots,
 };
@@ -2284,7 +2284,8 @@ impl Thread {
             update_agent_location,
         ));
         if let Some(workspace) = session_workspace {
-            self.add_tool(SessionDiscoverReposTool::new(workspace.clone()));
+            let http_client = self.project.read(cx).client().http_client();
+            self.add_tool(SessionSearchReposTool::new(workspace.clone(), http_client));
             self.add_tool(SessionReadRepoTool::new(workspace.clone()));
             self.add_tool(SessionAttachRepoTool::new(workspace.clone()));
             self.add_tool(SessionStatusTool::new(workspace));
@@ -4284,6 +4285,27 @@ impl Thread {
                 match title {
                     Ok(title) => {
                         this.set_title(title.clone(), cx);
+                        let repository_roots = this
+                            .project
+                            .read(cx)
+                            .worktrees(cx)
+                            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                            .collect::<Vec<_>>();
+                        if let Some(session_workspace) = session_workspace_for_roots(
+                            &crate::session_sandbox::session_home(),
+                            &repository_roots,
+                        ) && zession_core::read_manifest(&session_workspace.session_id)
+                            .is_ok_and(|manifest| {
+                                manifest.title_source != Some(zession_core::TitleSource::User)
+                            })
+                        {
+                            zession_core::set_title(
+                                &session_workspace.session_id,
+                                title.as_ref(),
+                                zession_core::TitleSource::Auto,
+                            )
+                            .log_err();
+                        }
                         if let Some(on_generated_title) = on_generated_title {
                             on_generated_title(title, cx);
                         }

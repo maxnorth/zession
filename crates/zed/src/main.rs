@@ -736,6 +736,7 @@ fn main() {
 
         audio::init(cx);
         workspace::init(app_state.clone(), cx);
+        zession_core::init(cx);
         zession::init(app_state.fs.clone(), cx);
         ui_prompt::init(cx);
 

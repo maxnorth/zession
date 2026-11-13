@@ -1,80 +1,79 @@
 use std::{
     path::{Component, Path, PathBuf},
-    process::Output,
     sync::Arc,
+    time::Duration,
 };
 
 use agent_client_protocol::v2::schema as acp;
 use futures::FutureExt as _;
-use gpui::{App, AppContext as _, AsyncApp, SharedString, Task};
+use gpui::{App, AsyncApp, SharedString, Task};
+use http_client::HttpClient;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use util::command::new_command;
+use settings::{Settings, update_settings_file_with_completion};
 
 use crate::session_sandbox::session_home_for_roots;
 use crate::{AgentTool, ToolCallEventStream, ToolInput, ToolPermissionContext};
 
-const OUTPUT_LIMIT: usize = 16 * 1024;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionWorkspace {
-    session_dir: PathBuf,
-    session_id: String,
+    pub session_dir: PathBuf,
+    pub session_id: String,
 }
 
 pub(crate) fn session_workspace_for_roots(
     session_home: &Path,
     roots: &[PathBuf],
 ) -> Option<SessionWorkspace> {
-    let session_home = session_home_for_roots(session_home, roots)?;
-    let sessions_root = session_home.join("sessions");
-    let canonical_sessions_root = sessions_root.canonicalize().ok();
-
-    roots.iter().find_map(|root| {
-        let relative_root = match (root.canonicalize(), canonical_sessions_root.as_deref()) {
-            (Ok(canonical_root), Some(canonical_sessions_root)) => canonical_root
-                .strip_prefix(canonical_sessions_root)
-                .ok()?
-                .to_path_buf(),
-            _ => root.strip_prefix(&sessions_root).ok()?.to_path_buf(),
-        };
-        let session_id = relative_root
-            .components()
-            .find_map(|component| match component {
-                Component::Normal(name) => name.to_str(),
-                _ => None,
-            })?
-            .to_owned();
-
-        Some(SessionWorkspace {
-            session_dir: sessions_root.join(&session_id),
-            session_id,
-        })
+    if roots.len() != 1 || session_home_for_roots(session_home, roots).is_none() {
+        return None;
+    }
+    let workspaces_root = session_home.join("workspaces");
+    let root = &roots[0];
+    let relative = match (root.canonicalize(), workspaces_root.canonicalize()) {
+        (Ok(root), Ok(workspaces_root)) => root.strip_prefix(workspaces_root).ok()?.to_path_buf(),
+        _ => root.strip_prefix(&workspaces_root).ok()?.to_path_buf(),
+    };
+    let mut components = relative.components();
+    let Component::Normal(session_id) = components.next()? else {
+        return None;
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    let session_id = session_id.to_str()?.to_owned();
+    zession_core::read_manifest_at(session_home, &session_id).ok()?;
+    Some(SessionWorkspace {
+        session_dir: workspaces_root.join(&session_id),
+        session_id,
     })
 }
 
-/// Find Session repositories that are relevant to a natural-language question.
+/// Find approved repositories relevant to a question, without attaching them.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct SessionDiscoverReposInput {
-    /// The question or topic to search for in the user's approved repositories.
-    question: String,
+pub struct SessionSearchReposInput {
+    /// A question or topic to search for in the user's approved repositories.
+    query: String,
 }
 
-pub struct SessionDiscoverReposTool {
+pub struct SessionSearchReposTool {
     workspace: SessionWorkspace,
+    http_client: Arc<dyn HttpClient>,
 }
 
-impl SessionDiscoverReposTool {
-    pub(crate) fn new(workspace: SessionWorkspace) -> Self {
-        Self { workspace }
+impl SessionSearchReposTool {
+    pub(crate) fn new(workspace: SessionWorkspace, http_client: Arc<dyn HttpClient>) -> Self {
+        Self {
+            workspace,
+            http_client,
+        }
     }
 }
 
-impl AgentTool for SessionDiscoverReposTool {
-    type Input = SessionDiscoverReposInput;
+impl AgentTool for SessionSearchReposTool {
+    type Input = SessionSearchReposInput;
     type Output = String;
-
-    const NAME: &'static str = "session_discover_repos";
+    const NAME: &'static str = "session_search_repos";
 
     fn kind() -> acp::ToolKind {
         acp::ToolKind::Search
@@ -85,7 +84,7 @@ impl AgentTool for SessionDiscoverReposTool {
         _input: Result<Self::Input, serde_json::Value>,
         _cx: &mut App,
     ) -> SharedString {
-        "Discover Session repositories".into()
+        "Search Session repositories".into()
     }
 
     fn run(
@@ -95,17 +94,32 @@ impl AgentTool for SessionDiscoverReposTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         let workspace = self.workspace.clone();
+        let http_client = self.http_client.clone();
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|error| error.to_string())?;
-            let arguments = vec![
-                "repos".to_string(),
-                "discover".to_string(),
-                "--json".to_string(),
-                "--quiet".to_string(),
-                input.question,
-            ];
-            let output = background_session_command(cx, workspace, arguments).await?;
-            command_stdout(output)
+            let settings = cx.update(|cx| zession_core::ZessionSettings::get_global(cx).clone());
+            let hits = zession_core::search_repos(
+                &input.query,
+                Some(&workspace.session_id),
+                &settings,
+                http_client,
+            )
+            .await
+            .map_err(|error| format!("Could not search Session repositories: {error:#}"))?;
+            let hits = hits
+                .into_iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "repoId": hit.repo_id,
+                        "description": hit.description,
+                        "stored": hit.stored,
+                        "indexed": hit.indexed,
+                        "attachedInCurrentSession": hit.attached_in_current_session,
+                        "excerpt": hit.excerpt,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json_output(&hits)
         })
     }
 }
@@ -119,20 +133,20 @@ enum SessionRepoOperation {
     Log,
 }
 
-/// Read approved repository code without attaching it. Attach a repository only before editing, building, or testing.
+/// Read code from an approved repository without attaching it. Attach only before editing, building, or testing.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SessionReadRepoInput {
-    /// The approved repository identifier, such as `owner/repository`.
+    /// An approved repository identifier, such as `owner/repository`.
     repo: String,
-    /// The fixed read operation to perform.
+    /// One fixed read operation: `list_files`, `show`, `grep`, or `log`.
     operation: SessionRepoOperation,
-    /// A repository-relative path for filtering or showing files.
+    /// A repository-relative path to show or filter by.
     #[serde(default)]
     path: Option<String>,
-    /// A literal search pattern required for the `grep` operation.
+    /// A search pattern, required for `grep`.
     #[serde(default)]
     pattern: Option<String>,
-    /// A Git ref to read; defaults to `HEAD`.
+    /// A Git ref; defaults to `HEAD`.
     #[serde(default)]
     git_ref: Option<String>,
 }
@@ -147,78 +161,9 @@ impl SessionReadRepoTool {
     }
 }
 
-fn read_repo_args(input: &SessionReadRepoInput) -> Result<Vec<String>, String> {
-    if input.repo.trim().is_empty() || input.repo.starts_with('-') {
-        return Err("repo must be a repository identifier".to_string());
-    }
-
-    let git_ref = input.git_ref.as_deref().unwrap_or("HEAD");
-    if git_ref.trim().is_empty() || git_ref.starts_with('-') {
-        return Err("git_ref must be a non-option Git ref".to_string());
-    }
-
-    let mut arguments = vec!["repos".to_string(), "git".to_string(), input.repo.clone()];
-    match input.operation {
-        SessionRepoOperation::ListFiles => {
-            arguments.extend([
-                "ls-tree".to_string(),
-                "-r".to_string(),
-                "--name-only".to_string(),
-                git_ref.to_string(),
-            ]);
-            if let Some(path) = non_empty(input.path.as_deref()) {
-                arguments.extend(["--".to_string(), path.to_string()]);
-            }
-        }
-        SessionRepoOperation::Show => {
-            let path = required_path(input.path.as_deref())?;
-            arguments.extend(["show".to_string(), format!("{git_ref}:{path}")]);
-        }
-        SessionRepoOperation::Grep => {
-            let pattern = non_empty(input.pattern.as_deref())
-                .ok_or_else(|| "pattern is required for grep".to_string())?;
-            if pattern.starts_with('-') {
-                return Err("pattern must not start with '-'".to_string());
-            }
-            arguments.extend([
-                "grep".to_string(),
-                "-n".to_string(),
-                "-e".to_string(),
-                pattern.to_string(),
-                git_ref.to_string(),
-            ]);
-            if let Some(path) = non_empty(input.path.as_deref()) {
-                arguments.extend(["--".to_string(), path.to_string()]);
-            }
-        }
-        SessionRepoOperation::Log => {
-            arguments.extend([
-                "log".to_string(),
-                "--oneline".to_string(),
-                "-n".to_string(),
-                "30".to_string(),
-                git_ref.to_string(),
-            ]);
-            if let Some(path) = non_empty(input.path.as_deref()) {
-                arguments.extend(["--".to_string(), path.to_string()]);
-            }
-        }
-    }
-    Ok(arguments)
-}
-
-fn required_path(path: Option<&str>) -> Result<&str, String> {
-    non_empty(path).ok_or_else(|| "path is required for show".to_string())
-}
-
-fn non_empty(value: Option<&str>) -> Option<&str> {
-    value.filter(|value| !value.trim().is_empty())
-}
-
 impl AgentTool for SessionReadRepoTool {
     type Input = SessionReadRepoInput;
     type Output = String;
-
     const NAME: &'static str = "session_read_repo";
 
     fn kind() -> acp::ToolKind {
@@ -230,15 +175,10 @@ impl AgentTool for SessionReadRepoTool {
         input: Result<Self::Input, serde_json::Value>,
         _cx: &mut App,
     ) -> SharedString {
-        match input {
-            Ok(input) => format!(
-                "Read {} from {}",
-                operation_name(input.operation),
-                input.repo
-            )
-            .into(),
-            Err(_) => "Read Session repository".into(),
-        }
+        input.map_or_else(
+            |_| "Read Session repository".into(),
+            |input| format!("Read {:?} from {}", input.operation, input.repo).into(),
+        )
     }
 
     fn run(
@@ -247,75 +187,76 @@ impl AgentTool for SessionReadRepoTool {
         _event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
-        let workspace = self.workspace.clone();
+        let _workspace = self.workspace.clone();
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|error| error.to_string())?;
-            let arguments = read_repo_args(&input)?;
-            let output = background_session_command(cx, workspace, arguments).await?;
-            command_stdout(output)
+            let settings = cx.update(|cx| zession_core::ZessionSettings::get_global(cx).clone());
+            let operation = repo_operation(&input)?;
+            let output = zession_core::read_repo(&input.repo, operation, &settings)
+                .await
+                .map_err(|error| format!("Could not read repository: {error:#}"))?;
+            Ok(truncate_text(&output))
         })
     }
 }
 
-fn operation_name(operation: SessionRepoOperation) -> &'static str {
-    match operation {
-        SessionRepoOperation::ListFiles => "files",
-        SessionRepoOperation::Show => "file",
-        SessionRepoOperation::Grep => "matches",
-        SessionRepoOperation::Log => "history",
+fn repo_operation(input: &SessionReadRepoInput) -> Result<zession_core::RepoOperation, String> {
+    let git_ref = input.git_ref.clone();
+    if git_ref
+        .as_deref()
+        .is_some_and(|value| value.starts_with('-'))
+    {
+        return Err("git_ref must not start with '-'".to_string());
+    }
+    if input.repo.trim().is_empty() || input.repo.starts_with('-') {
+        return Err("repo must be a repository identifier".to_string());
+    }
+    match input.operation {
+        SessionRepoOperation::ListFiles => Ok(zession_core::RepoOperation::ListFiles {
+            git_ref,
+            path: input.path.clone(),
+        }),
+        SessionRepoOperation::Show => {
+            let path = input
+                .path
+                .clone()
+                .filter(|path| !path.trim().is_empty())
+                .ok_or_else(|| "path is required for show".to_string())?;
+            Ok(zession_core::RepoOperation::Show { path, git_ref })
+        }
+        SessionRepoOperation::Grep => {
+            let pattern = input
+                .pattern
+                .clone()
+                .filter(|pattern| !pattern.trim().is_empty())
+                .ok_or_else(|| "pattern is required for grep".to_string())?;
+            if pattern.starts_with('-') {
+                return Err("pattern must not start with '-'".to_string());
+            }
+            Ok(zession_core::RepoOperation::Grep {
+                pattern,
+                git_ref,
+                path: input.path.clone(),
+            })
+        }
+        SessionRepoOperation::Log => Ok(zession_core::RepoOperation::Log {
+            git_ref,
+            path: input.path.clone(),
+        }),
     }
 }
 
-/// Attach a repository before editing, building, or testing it. Use `session_read_repo` for questions that only need code reading.
+/// Attach a repository before editing, building, or testing it. Use `session_read_repo` for read-only questions.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SessionAttachRepoInput {
-    /// The repository identifier to attach, such as `owner/repository`.
+    /// The repository shorthand, URL, or local Git directory to attach.
     repo: String,
     /// Optional worktree directory name.
     #[serde(default)]
     name: Option<String>,
-    /// Optional base branch for the Session worktree.
+    /// Optional base branch or ref.
     #[serde(default)]
     base: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AddRepoSuccess {
-    session: String,
-    repos: Vec<AttachedRepository>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AttachedRepository {
-    name: String,
-    path: String,
-    branch: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum AddRepoResponse {
-    Success(AddRepoSuccess),
-    Error(AddRepoFailure),
-}
-
-#[derive(Debug, Deserialize)]
-struct AddRepoFailure {
-    error: String,
-    code: String,
-    repo: String,
-}
-
-fn parse_add_json(output: &str) -> Result<AddRepoSuccess, AddRepoFailure> {
-    match serde_json::from_str::<AddRepoResponse>(output) {
-        Ok(AddRepoResponse::Success(success)) => Ok(success),
-        Ok(AddRepoResponse::Error(error)) => Err(error),
-        Err(error) => Err(AddRepoFailure {
-            error: format!("could not parse `session repos add --json` output: {error}"),
-            code: "error".to_string(),
-            repo: String::new(),
-        }),
-    }
 }
 
 pub struct SessionAttachRepoTool {
@@ -331,7 +272,6 @@ impl SessionAttachRepoTool {
 impl AgentTool for SessionAttachRepoTool {
     type Input = SessionAttachRepoInput;
     type Output = String;
-
     const NAME: &'static str = "session_attach_repo";
 
     fn kind() -> acp::ToolKind {
@@ -343,10 +283,10 @@ impl AgentTool for SessionAttachRepoTool {
         input: Result<Self::Input, serde_json::Value>,
         _cx: &mut App,
     ) -> SharedString {
-        match input {
-            Ok(input) => format!("Attach {} to Session", input.repo).into(),
-            Err(_) => "Attach repository to Session".into(),
-        }
+        input.map_or_else(
+            |_| "Attach repository to Session".into(),
+            |input| format!("Attach {} to Session", input.repo).into(),
+        )
     }
 
     fn run(
@@ -358,41 +298,52 @@ impl AgentTool for SessionAttachRepoTool {
         let workspace = self.workspace.clone();
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|error| error.to_string())?;
-            let command_description = attach_command_description(&input);
-            let authorization = cx.update(|cx| {
+            let spec = zession_core::RepoSpec::parse(&input.repo)
+                .map_err(|error| format!("Invalid repository: {error:#}"))?;
+            let permission = cx.update(|cx| {
                 event_stream.authorize(
-                    format!("Attach {} to Session", input.repo),
-                    ToolPermissionContext::new(Self::NAME, vec![command_description]),
+                    format!("Attach {} to Session", spec.repo_id),
+                    ToolPermissionContext::new(Self::NAME, vec![spec.repo_id.clone()]),
                     cx,
                 )
             });
             futures::select! {
-                result = authorization.fuse() => result.map_err(|error| error.to_string())?,
+                result = permission.fuse() => result.map_err(|error| error.to_string())?,
                 _ = event_stream.cancelled_by_user().fuse() => {
-                    return Err("Session repository attachment cancelled by the user.".to_string());
+                    return Err("Session repository attachment was cancelled.".to_string());
                 }
             };
-
-            let output = background_session_command(
-                cx,
-                workspace.clone(),
-                attach_repo_args(&input, &workspace.session_id),
+            let settings =
+                cx.update(|cx| zession_core::ZessionSettings::get_global(cx).clone());
+            match zession_core::attach_repo(
+                &workspace.session_id,
+                &spec,
+                input.name.as_deref(),
+                input.base.as_deref(),
+                &settings,
             )
-            .await?;
-            let attached = match add_command_result(output) {
-                Ok(attached) => attached,
-                Err(failure) if failure.code == "repo_not_approved" => {
-                    let repo = if failure.repo.is_empty() {
-                        input.repo.clone()
-                    } else {
-                        failure.repo
-                    };
+                .await
+            {
+                Ok(repository) => {
+                    index_attached_repo(&spec, &settings, cx);
+                    Ok(format!(
+                        "Attached {} at {} on branch {}.",
+                        repository.name,
+                        repository.path.display(),
+                        repository.branch
+                    ))
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<zession_core::ZessionError>()
+                        .is_some_and(|error| matches!(error, zession_core::ZessionError::NotApproved { .. })) =>
+                {
                     let approval = cx.update(|cx| {
                         event_stream.authorize_always_prompt(
-                            format!("Approve {repo} for Session?"),
+                            format!("Approve {} for Session?", spec.repo_id),
                             ToolPermissionContext::new(
                                 Self::NAME,
-                                vec![format!("session repos allow {repo} --yes")],
+                                vec![format!("zession.repos.allow {}", spec.repo_id)],
                             ),
                             cx,
                         )
@@ -400,116 +351,88 @@ impl AgentTool for SessionAttachRepoTool {
                     futures::select! {
                         result = approval.fuse() => {
                             if result.is_err() {
-                                return Err(format!("The user declined to approve {repo} for Session."));
+                                return Err(format!("The user declined to approve {} for Session.", spec.repo_id));
                             }
                         },
                         _ = event_stream.cancelled_by_user().fuse() => {
-                            return Err(format!("The user declined to approve {repo} for Session."));
+                            return Err(format!("The user declined to approve {} for Session.", spec.repo_id));
                         }
                     };
-
-                    let allow_output = background_session_command(
-                        cx,
-                        workspace.clone(),
-                        vec![
-                            "repos".to_string(),
-                            "allow".to_string(),
-                            repo.clone(),
-                            "--yes".to_string(),
-                        ],
+                    let fs = cx.update(|cx| <dyn fs::Fs>::global(cx));
+                    let repo_id = spec.repo_id.clone();
+                    let settings_update = cx.update(|cx| {
+                        update_settings_file_with_completion(fs, cx, move |settings, _| {
+                            let repos = settings
+                                .zession
+                                .get_or_insert_default()
+                                .repos
+                                .get_or_insert_default();
+                            let allow = repos.allow.get_or_insert_default();
+                            add_repo_to_allow_list(allow, &repo_id);
+                        })
+                    });
+                    settings_update
+                        .await
+                        .map_err(|error| {
+                            format!("Could not persist Session repository approval: {error}")
+                        })?
+                        .map_err(|error| {
+                            format!("Could not persist Session repository approval: {error:#}")
+                        })?;
+                    let mut settings =
+                        cx.update(|cx| zession_core::ZessionSettings::get_global(cx).clone());
+                    add_repo_to_allow_list(&mut settings.repos_allow, &spec.repo_id);
+                    let repository = zession_core::attach_repo(
+                        &workspace.session_id,
+                        &spec,
+                        input.name.as_deref(),
+                        input.base.as_deref(),
+                        &settings,
                     )
-                    .await?;
-                    if !allow_output.status.success() {
-                        return Err(command_failure(&allow_output));
-                    }
-
-                    let retry_output = background_session_command(
-                        cx,
-                        workspace.clone(),
-                        attach_repo_args(&input, &workspace.session_id),
-                    )
-                    .await?;
-                    add_command_result(retry_output).map_err(|failure| {
-                        truncate_output(
-                            format!("Could not attach {repo} after approval: {}", failure.error)
-                                .as_bytes(),
-                        )
-                    })?
+                    .await
+                    .map_err(|error| format!("Could not attach repository after approval: {error:#}"))?;
+                    index_attached_repo(&spec, &settings, cx);
+                    Ok(format!(
+                        "Attached {} at {} on branch {}.",
+                        repository.name,
+                        repository.path.display(),
+                        repository.branch
+                    ))
                 }
-                Err(failure) => return Err(truncate_output(failure.error.as_bytes())),
-            };
-
-            let repository = attached
-                .repos
-                .first()
-                .ok_or_else(|| "Session attached no repositories.".to_string())?;
-            if attached.session.is_empty() {
-                return Err("Session CLI returned an empty Session path.".to_string());
+                Err(error) => Err(format!("Could not attach repository: {error:#}")),
             }
-            Ok(format!(
-                "Attached {} at {} on branch {}.",
-                repository.name, repository.path, repository.branch
-            ))
         })
     }
 }
 
-fn attach_command_description(input: &SessionAttachRepoInput) -> String {
-    let mut command = format!("session repos add {} --json", input.repo);
-    if let Some(name) = &input.name {
-        command.push_str(&format!(" --as {name}"));
+fn index_attached_repo(
+    spec: &zession_core::RepoSpec,
+    settings: &zession_core::ZessionSettings,
+    cx: &mut AsyncApp,
+) {
+    if !settings.auto_index {
+        return;
     }
-    if let Some(base) = &input.base {
-        command.push_str(&format!(" --branch {base}"));
-    }
-    command
-}
-
-fn attach_repo_args(input: &SessionAttachRepoInput, session_id: &str) -> Vec<String> {
-    let mut arguments = vec![
-        "repos".to_string(),
-        "add".to_string(),
-        input.repo.clone(),
-        "--json".to_string(),
-    ];
-    if let Some(name) = &input.name {
-        arguments.extend(["--as".to_string(), name.clone()]);
-    }
-    if let Some(base) = &input.base {
-        arguments.extend(["--branch".to_string(), base.clone()]);
-    }
-    arguments.extend(["--session".to_string(), session_id.to_string()]);
-    arguments
-}
-
-fn add_command_result(output: Output) -> Result<AddRepoSuccess, AddRepoFailure> {
-    match parse_add_json(&String::from_utf8_lossy(&output.stdout)) {
-        Ok(success) if output.status.success() => Ok(success),
-        Ok(_) => Err(AddRepoFailure {
-            error: command_failure(&output),
-            code: "error".to_string(),
-            repo: String::new(),
-        }),
-        Err(failure) => {
-            if !output.status.success()
-                && failure.code == "error"
-                && failure.repo.is_empty()
-                && !String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .starts_with('{')
-            {
-                return Err(AddRepoFailure {
-                    error: command_failure(&output),
-                    code: "error".to_string(),
-                    repo: String::new(),
-                });
-            }
-            Err(failure)
+    let spec = spec.clone();
+    let settings = settings.clone();
+    cx.spawn(async move |cx| {
+        let result = async {
+            let store = zession_core::ensure_store_fresh(
+                &spec,
+                Duration::from_secs(settings.store_max_age_minutes.saturating_mul(60)),
+                false,
+            )
+            .await?;
+            zession_core::index_repo_if_enabled(&settings, &store, cx).await
         }
-    }
+        .await;
+        if let Err(error) = result {
+            log::debug!("could not index attached Session repository: {error:#}");
+        }
+    })
+    .detach();
 }
 
-/// Return the current Session id, title, path, and attached repository status.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SessionStatusInput {}
 
@@ -526,7 +449,6 @@ impl SessionStatusTool {
 impl AgentTool for SessionStatusTool {
     type Input = SessionStatusInput;
     type Output = String;
-
     const NAME: &'static str = "session_status";
 
     fn kind() -> acp::ToolKind {
@@ -538,7 +460,7 @@ impl AgentTool for SessionStatusTool {
         _input: Result<Self::Input, serde_json::Value>,
         _cx: &mut App,
     ) -> SharedString {
-        "Read Session status".into()
+        "Show Session status".into()
     }
 
     fn run(
@@ -547,227 +469,148 @@ impl AgentTool for SessionStatusTool {
         _event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
-        let workspace = self.workspace.clone();
-        cx.spawn(async move |cx| {
+        let session_id = self.workspace.session_id.clone();
+        cx.spawn(async move |_cx| {
             input.recv().await.map_err(|error| error.to_string())?;
-            let output = background_session_command(
-                cx,
-                workspace,
-                vec!["status".to_string(), "--json".to_string()],
-            )
-            .await?;
-            command_stdout(output)
+            let status = zession_core::session_status(&session_id)
+                .await
+                .map_err(|error| format!("Could not read Session status: {error:#}"))?;
+            json_output(&status)
         })
     }
 }
 
-async fn background_session_command(
-    cx: &mut AsyncApp,
-    workspace: SessionWorkspace,
-    arguments: Vec<String>,
-) -> Result<Output, String> {
-    cx.background_spawn(async move { run_session_command(workspace, arguments).await })
-        .await
+fn json_output(value: &impl Serialize) -> Result<String, String> {
+    let output = serde_json::to_string(value).map_err(|error| error.to_string())?;
+    Ok(truncate_text(&output))
 }
 
-async fn run_session_command(
-    workspace: SessionWorkspace,
-    arguments: Vec<String>,
-) -> Result<Output, String> {
-    let mut command = new_command("session");
-    command.current_dir(&workspace.session_dir).args(arguments);
-    command
-        .output()
-        .await
-        .map_err(|error| format!("could not run the Session CLI: {error}"))
-}
-
-fn command_stdout(output: Output) -> Result<String, String> {
-    if output.status.success() {
-        Ok(truncate_output(&output.stdout))
+fn add_repo_to_allow_list(allow: &mut Vec<String>, repo_id: &str) -> bool {
+    if allow.iter().any(|entry| entry == repo_id) {
+        false
     } else {
-        Err(command_failure(&output))
+        allow.push(repo_id.to_owned());
+        true
     }
 }
 
-fn command_failure(output: &Output) -> String {
-    let stderr = truncate_output(&output.stderr);
-    if stderr.trim().is_empty() {
-        format!("Session CLI exited with {}", output.status)
-    } else {
-        format!("Session CLI exited with {}: {stderr}", output.status)
+fn truncate_text(text: &str) -> String {
+    if text.len() <= 16 * 1024 {
+        return text.to_owned();
     }
-}
-
-fn truncate_output(output: &[u8]) -> String {
-    let truncated = output.len() > OUTPUT_LIMIT;
-    let mut text = String::from_utf8_lossy(&output[..output.len().min(OUTPUT_LIMIT)]).into_owned();
-    if truncated {
-        text.push_str("\n[output truncated]");
+    let mut end = 16 * 1024;
+    while !text.is_char_boundary(end) {
+        end -= 1;
     }
-    text
+    format!("{}… [output truncated]", &text[..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn input(operation: SessionRepoOperation) -> SessionReadRepoInput {
-        SessionReadRepoInput {
-            repo: "maxnorth/session".to_string(),
+    #[test]
+    fn repo_operations_have_fixed_arguments_and_validate_required_values() {
+        let input = |operation, path, pattern, git_ref| SessionReadRepoInput {
+            repo: "owner/repo".to_string(),
             operation,
-            path: None,
-            pattern: None,
-            git_ref: None,
-        }
-    }
-
-    #[test]
-    fn read_repo_args_maps_list_files() {
-        let mut input = input(SessionRepoOperation::ListFiles);
+            path,
+            pattern,
+            git_ref,
+        };
         assert_eq!(
-            read_repo_args(&input).expect("list_files arguments"),
-            [
-                "repos",
-                "git",
-                "maxnorth/session",
-                "ls-tree",
-                "-r",
-                "--name-only",
-                "HEAD",
-            ]
+            repo_operation(&input(
+                SessionRepoOperation::ListFiles,
+                Some("src".into()),
+                None,
+                None
+            )),
+            Ok(zession_core::RepoOperation::ListFiles {
+                git_ref: None,
+                path: Some("src".into()),
+            })
         );
-
-        input.path = Some("src".to_string());
         assert_eq!(
-            read_repo_args(&input).expect("path-filtered list_files arguments"),
-            [
-                "repos",
-                "git",
-                "maxnorth/session",
-                "ls-tree",
-                "-r",
-                "--name-only",
-                "HEAD",
-                "--",
-                "src",
-            ]
+            repo_operation(&input(
+                SessionRepoOperation::Show,
+                Some("src/lib.rs".into()),
+                None,
+                None
+            )),
+            Ok(zession_core::RepoOperation::Show {
+                path: "src/lib.rs".into(),
+                git_ref: None,
+            })
         );
-    }
-
-    #[test]
-    fn read_repo_args_maps_show() {
-        let mut input = input(SessionRepoOperation::Show);
-        input.path = Some("main.go".to_string());
         assert_eq!(
-            read_repo_args(&input).expect("show arguments"),
-            ["repos", "git", "maxnorth/session", "show", "HEAD:main.go"]
+            repo_operation(&input(
+                SessionRepoOperation::Grep,
+                None,
+                Some("needle".into()),
+                Some("main".into())
+            )),
+            Ok(zession_core::RepoOperation::Grep {
+                pattern: "needle".into(),
+                git_ref: Some("main".into()),
+                path: None,
+            })
         );
-    }
-
-    #[test]
-    fn read_repo_args_maps_grep() {
-        let mut input = input(SessionRepoOperation::Grep);
-        input.pattern = Some("resolveSession".to_string());
-        input.git_ref = Some("main".to_string());
-        input.path = Some("main.go".to_string());
         assert_eq!(
-            read_repo_args(&input).expect("grep arguments"),
-            [
-                "repos",
-                "git",
-                "maxnorth/session",
-                "grep",
-                "-n",
-                "-e",
-                "resolveSession",
-                "main",
-                "--",
-                "main.go",
-            ]
+            repo_operation(&input(SessionRepoOperation::Log, None, None, None)),
+            Ok(zession_core::RepoOperation::Log {
+                git_ref: None,
+                path: None,
+            })
+        );
+        assert!(repo_operation(&input(SessionRepoOperation::Show, None, None, None)).is_err());
+        assert!(repo_operation(&input(SessionRepoOperation::Grep, None, None, None)).is_err());
+        assert!(
+            repo_operation(&input(
+                SessionRepoOperation::ListFiles,
+                None,
+                None,
+                Some("-n".into())
+            ))
+            .is_err()
+        );
+        assert!(
+            repo_operation(&input(
+                SessionRepoOperation::Grep,
+                None,
+                Some("-e".into()),
+                None
+            ))
+            .is_err()
         );
     }
 
     #[test]
-    fn read_repo_args_maps_log() {
-        let mut input = input(SessionRepoOperation::Log);
-        input.path = Some("main.go".to_string());
-        assert_eq!(
-            read_repo_args(&input).expect("log arguments"),
-            [
-                "repos",
-                "git",
-                "maxnorth/session",
-                "log",
-                "--oneline",
-                "-n",
-                "30",
-                "HEAD",
-                "--",
-                "main.go",
-            ]
-        );
+    fn repo_approval_adds_only_the_exact_entry_once() {
+        let mut allow = vec!["owner/*".to_string()];
+        assert!(add_repo_to_allow_list(&mut allow, "owner/repo"));
+        assert!(!add_repo_to_allow_list(&mut allow, "owner/repo"));
+        assert_eq!(allow, vec!["owner/*".to_string(), "owner/repo".to_string()]);
+
+        let mut settings = zession_core::ZessionSettings {
+            repos_allow: Vec::new(),
+            repos_access: Default::default(),
+            auto_index: true,
+            store_max_age_minutes: 10,
+            index_model: None,
+        };
+        add_repo_to_allow_list(&mut settings.repos_allow, "owner/repo");
+        assert!(zession_core::is_allowed(&settings, "owner/repo").expect("check approval"));
+        assert!(!zession_core::is_allowed(&settings, "owner/other").expect("check other repo"));
     }
 
     #[test]
-    fn read_repo_args_rejects_missing_fields_and_option_like_values() {
-        let mut input = input(SessionRepoOperation::Show);
-        assert!(read_repo_args(&input).is_err());
-
-        input.operation = SessionRepoOperation::Grep;
-        assert!(read_repo_args(&input).is_err());
-        input.pattern = Some("-n".to_string());
-        assert!(read_repo_args(&input).is_err());
-
-        input.pattern = Some("resolveSession".to_string());
-        input.git_ref = Some("--all".to_string());
-        assert!(read_repo_args(&input).is_err());
-    }
-
-    #[test]
-    fn session_workspace_requires_a_session_root() {
-        let temporary_directory = tempfile::tempdir().expect("temporary directory");
-        let session_home = temporary_directory.path().join(".session");
-        let session_dir = session_home.join("sessions/first");
-        std::fs::create_dir_all(&session_dir).expect("create Session directory");
-        let repository_root = session_dir.join("repo");
-        std::fs::create_dir_all(&repository_root).expect("create repository root");
-        let sessions_root = session_home.join("sessions");
-        let outside_root = temporary_directory.path().join("project");
-        std::fs::create_dir_all(&outside_root).expect("create outside root");
-
-        let workspace = session_workspace_for_roots(&session_home, &[repository_root])
-            .expect("Session root should register");
-        assert_eq!(workspace.session_dir, session_dir);
-        assert_eq!(workspace.session_id, "first");
-        assert!(session_workspace_for_roots(&session_home, &[outside_root]).is_none());
-        assert!(session_workspace_for_roots(&session_home, &[sessions_root]).is_none());
-    }
-
-    #[test]
-    fn parses_add_json_success() {
-        let result = parse_add_json(
-            r#"{"session":"/home/user/.session/sessions/first","repos":[{"name":"session","path":"/home/user/.session/sessions/first/session","branch":"session/first","remote":"https://github.com/maxnorth/session.git","baseRef":"origin/main"}]}"#,
-        )
-        .expect("success response");
-        assert_eq!(result.session, "/home/user/.session/sessions/first");
-        assert_eq!(result.repos.len(), 1);
-        assert_eq!(result.repos[0].name, "session");
-        assert_eq!(
-            result.repos[0].path,
-            "/home/user/.session/sessions/first/session"
-        );
-        assert_eq!(result.repos[0].branch, "session/first");
-    }
-
-    #[test]
-    fn parses_add_json_repo_not_approved_error() {
-        let error = parse_add_json(
-            r#"{"error":"maxnorth/session is not from an approved owner","code":"repo_not_approved","repo":"maxnorth/session"}"#,
-        )
-        .expect_err("approval error response");
-        assert_eq!(error.code, "repo_not_approved");
-        assert_eq!(error.repo, "maxnorth/session");
-        assert!(error.error.contains("not from an approved owner"));
+    fn session_registration_requires_a_single_manifest_workspace_root() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let home = temporary_directory.path();
+        let session = zession_core::create_session_at(home, Some("first")).unwrap();
+        assert!(session_workspace_for_roots(home, std::slice::from_ref(&session.dir)).is_some());
+        assert!(session_workspace_for_roots(home, &[home.join("elsewhere")]).is_none());
+        let duplicate_roots = [session.dir.clone(), session.dir];
+        assert!(session_workspace_for_roots(home, &duplicate_roots).is_none());
     }
 }

@@ -9,24 +9,24 @@ use std::{
 use util::command::new_command;
 
 pub(crate) fn session_home() -> PathBuf {
-    let session_home = env::var_os("SESSION_HOME")
+    let session_home = env::var_os("ZESSION_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| paths::home_dir().join(".session"));
+        .unwrap_or_else(|| paths::home_dir().join(".zession"));
     expand_home(&session_home)
 }
 
 pub(crate) fn session_home_for_roots(session_home: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
-    let sessions_root = session_home.join("sessions");
-    let canonical_sessions_root = sessions_root.canonicalize().ok();
+    let workspaces_root = session_home.join("workspaces");
+    let canonical_workspaces_root = workspaces_root.canonicalize().ok();
 
     roots
         .iter()
         .any(
-            |root| match (root.canonicalize(), canonical_sessions_root.as_deref()) {
+            |root| match (root.canonicalize(), canonical_workspaces_root.as_deref()) {
                 (Ok(canonical_root), Some(canonical_sessions_root)) => {
                     path_has_session_id(&canonical_root, canonical_sessions_root)
                 }
-                _ => path_has_session_id(root, &sessions_root),
+                _ => path_has_session_id(root, &workspaces_root),
             },
         )
         .then(|| session_home.to_path_buf())
@@ -50,8 +50,8 @@ fn expand_home(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn path_has_session_id(root: &Path, sessions_root: &Path) -> bool {
-    let Ok(relative_root) = root.strip_prefix(sessions_root) else {
+fn path_has_session_id(root: &Path, workspaces_root: &Path) -> bool {
+    let Ok(relative_root) = root.strip_prefix(workspaces_root) else {
         return false;
     };
     matches!(
@@ -73,7 +73,7 @@ async fn session_network_hosts_with_env(
                     Ok(entry) => match entry.file_type() {
                         Ok(file_type) if file_type.is_dir() => {
                             match entry.file_name().into_string() {
-                                Ok(host) if host != "local" && host != "github.com" => {
+                                Ok(host) if host != "local" => {
                                     store_hosts.insert(host);
                                 }
                                 Ok(_) => {}
@@ -175,8 +175,8 @@ mod tests {
     #[test]
     fn session_roots_grant_the_session_home() {
         let temporary_directory = tempfile::tempdir().unwrap();
-        let session_home = temporary_directory.path().join(".session");
-        let session_root = session_home.join("sessions/first");
+        let session_home = temporary_directory.path().join(".zession");
+        let session_root = session_home.join("workspaces/first");
         let repository_root = session_root.join("repo");
         fs::create_dir_all(&repository_root).unwrap();
 
@@ -190,7 +190,7 @@ mod tests {
         );
 
         fs::create_dir_all(session_home.join("outside")).unwrap();
-        let canonical_session_root = session_home.join("outside/../sessions/first");
+        let canonical_session_root = session_home.join("outside/../workspaces/first");
         assert_eq!(
             session_home_for_roots(&session_home, &[canonical_session_root]),
             Some(session_home)
@@ -198,10 +198,10 @@ mod tests {
     }
 
     #[test]
-    fn roots_outside_sessions_or_at_the_sessions_root_do_not_grant() {
+    fn roots_outside_workspaces_or_at_the_workspaces_root_do_not_grant() {
         let temporary_directory = tempfile::tempdir().unwrap();
-        let session_home = temporary_directory.path().join(".session");
-        let sessions_root = session_home.join("sessions");
+        let session_home = temporary_directory.path().join(".zession");
+        let sessions_root = session_home.join("workspaces");
         let outside_root = temporary_directory.path().join("workspace");
         fs::create_dir_all(&sessions_root).unwrap();
         fs::create_dir_all(&outside_root).unwrap();
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn network_hosts_include_store_hosts_and_git_url_rewrites() {
         let temporary_directory = tempfile::tempdir().unwrap();
-        let session_home = temporary_directory.path().join(".session");
+        let session_home = temporary_directory.path().join(".zession");
         fs::create_dir_all(session_home.join("store/github.com")).unwrap();
         fs::create_dir_all(session_home.join("store/local")).unwrap();
         let global_git_config = temporary_directory.path().join("gitconfig");
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn network_hosts_default_to_github_without_a_store_directory() {
         let temporary_directory = tempfile::tempdir().unwrap();
-        let session_home = temporary_directory.path().join(".session");
+        let session_home = temporary_directory.path().join(".zession");
         let global_git_config = temporary_directory.path().join("gitconfig");
         fs::write(&global_git_config, "").unwrap();
 

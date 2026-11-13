@@ -1333,7 +1333,7 @@
           "rename_symbol": true,
           "search_web": true,
           "session_attach_repo": true,
-          "session_discover_repos": true,
+          "session_search_repos": true,
           "session_read_repo": true,
           "session_status": true,
           "skill": true,
@@ -1360,7 +1360,7 @@
           "list_directory": true,
           "read_file": true,
           "search_web": true,
-          "session_discover_repos": true,
+          "session_search_repos": true,
           "session_read_repo": true,
           "session_status": true,
           "skill": true,
@@ -2780,6 +2780,15 @@
     //
     // Default: false
     "trust_all_worktrees": false,
+  },
+  "zession": {
+    "repos": {
+      "allow": [],
+      "access": {},
+    },
+    "auto_index": true,
+    "store_max_age_minutes": 10,
+    "index_model": null,
   },
   // Zed's Prettier integration settings.
   // Allows to enable/disable formatting with Prettier

@@ -1410,7 +1410,7 @@ mod tests {
         const EXCLUDED_TOOLS: &[&str] = &[
             // Read-only / low-risk tools that don't call decide_permission_from_settings
             "apply_code_action",
-            "session_discover_repos",
+            "session_search_repos",
             "session_read_repo",
             "session_status",
             // Interactive prompt: always asks the user via prompt_for_decision,

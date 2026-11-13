@@ -232,6 +232,7 @@ impl VsCodeSettings {
             repl: None,
             server_url: None,
             session: None,
+            zession: None,
             status_bar: self.status_bar_settings_content(),
             tab_bar: self.tab_bar_settings_content(),
             tab_switcher: None,

@@ -1,28 +1,31 @@
 use std::{
-    env,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use chrono::{DateTime, FixedOffset};
 use fs::Fs;
-use fuzzy_nucleo::{MaxResults, StringMatch, StringMatchCandidate, StringMatchOptions, match_strings};
 use futures::StreamExt;
+use fuzzy_nucleo::{
+    MaxResults, StringMatch, StringMatchCandidate, StringMatchOptions, match_strings,
+};
 use gpui::{
     Action, AnyElement, App, AsyncApp, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
     Focusable, Global, Render, SharedString, Subscription, Task, TaskExt, Window, actions,
 };
+use http_client::HttpClient;
 use picker::{Picker, PickerDelegate};
 use project::ProjectGroupKey;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use settings::{Settings, update_settings_file_with_completion};
 use ui::{ListItem, prelude::*};
 use util::{ResultExt, path_list::PathList};
 use workspace::{
-    ModalView, MultiWorkspace, OpenMode, Toast, Workspace,
-    notifications::NotificationId,
+    ModalView, MultiWorkspace, OpenMode, Toast, Workspace, notifications::NotificationId,
 };
+pub use zession_core::SessionManifest;
+use zession_core::ZessionSettings;
 
 actions!(
     zession,
@@ -36,38 +39,6 @@ actions!(
 #[serde(rename_all = "camelCase")]
 pub struct AttachRepository {
     pub session_dir: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionManifest {
-    pub id: String,
-    #[serde(default)]
-    pub title: Option<String>,
-    pub created: DateTime<FixedOffset>,
-    #[serde(default)]
-    pub last_opened: Option<DateTime<FixedOffset>>,
-    #[serde(default)]
-    pub repos: Vec<SessionRepo>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionRepo {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub remote: String,
-    #[serde(default)]
-    pub cache: String,
-    #[serde(default)]
-    pub path: String,
-    #[serde(default)]
-    pub branch: String,
-    #[serde(default)]
-    pub base_ref: String,
-    #[serde(default)]
-    pub base_commit: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,23 +59,7 @@ impl Session {
 }
 
 pub fn default_sessions_root() -> PathBuf {
-    let session_home = env::var_os("SESSION_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| paths::home_dir().join(".session"));
-    expand_home(&session_home).join("sessions")
-}
-
-fn expand_home(path: &Path) -> PathBuf {
-    let Some(path_string) = path.to_str() else {
-        return path.to_path_buf();
-    };
-    if path_string == "~" {
-        return paths::home_dir().to_path_buf();
-    }
-    if let Some(suffix) = path_string.strip_prefix("~/") {
-        return paths::home_dir().join(suffix);
-    }
-    path.to_path_buf()
+    zession_core::sessions_dir()
 }
 
 struct GlobalSessionStore(Entity<SessionStore>);
@@ -135,39 +90,20 @@ impl SessionStore {
 
             loop {
                 if !watch_fs.is_dir(&watch_root).await {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(2))
-                        .await;
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
                     continue;
                 }
 
-                let (root_events, root_watcher) = watch_fs
+                let (root_events, _root_watcher) = watch_fs
                     .watch(&watch_root, Duration::from_millis(100))
                     .await;
-                let mut events = futures::stream::SelectAll::new();
-                events.push(root_events);
-                let mut _watchers = vec![root_watcher];
-
-                let (_, session_directories) =
-                    read_sessions(watch_fs.clone(), &watch_root).await;
-                for session_directory in session_directories {
-                    if watch_fs.is_dir(&session_directory).await {
-                        let (session_events, watcher) = watch_fs
-                            .watch(&session_directory, Duration::from_millis(100))
-                            .await;
-                        events.push(session_events);
-                        _watchers.push(watcher);
-                    }
-                }
-
-                let (sessions, _) = read_sessions(watch_fs.clone(), &watch_root).await;
+                let mut events = root_events;
+                let sessions = read_sessions(watch_fs.clone(), &watch_root).await;
                 this.update(cx, |store, cx| store.replace_sessions(sessions, cx))
                     .log_err();
 
                 if events.next().await.is_none() {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(2))
-                        .await;
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
                 }
             }
         });
@@ -226,28 +162,10 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
         else {
             return;
         };
-        let command = cx.background_spawn(async move {
-            smol::process::Command::new("session")
-                .args(["new", "--no-agent"])
-                .output()
-                .await
-        });
-        cx.spawn(async move |cx| match command.await {
-            Ok(output) if output.status.success() => {
-                let output = String::from_utf8_lossy(&output.stdout);
-                let Some(session_directory) = output
-                    .lines()
-                    .map(str::trim)
-                    .rfind(|line| !line.is_empty())
-                    .map(PathBuf::from)
-                else {
-                    show_command_error(
-                        active_workspace,
-                        "The session command did not return a session directory".to_string(),
-                        cx,
-                    );
-                    return;
-                };
+        let create_session = cx.background_spawn(async { zession_core::create_session(None) });
+        cx.spawn(async move |cx| match create_session.await {
+            Ok(session) => {
+                let session_directory = session.dir;
                 let path_list = PathList::new(std::slice::from_ref(&session_directory));
                 let project_group = ProjectGroupKey::new(None, path_list.clone());
                 if let Err(error) = multi_workspace.update(cx, |multi_workspace, window, cx| {
@@ -266,18 +184,10 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
                     log::debug!("Failed to open new session workspace: {error:#}");
                 }
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                show_command_error(
-                    active_workspace,
-                    command_output_error(output.status, &stderr),
-                    cx,
-                );
-            }
             Err(error) => {
-                show_command_error(
+                show_session_error(
                     active_workspace,
-                    format!("Failed to run session new: {error}"),
+                    format!("Failed to create Session: {error:#}"),
                     cx,
                 );
             }
@@ -308,27 +218,27 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
             })?;
             store.session_for_dir(&dir).cloned()
         }) else {
-            multi_workspace.update(cx, |multi_workspace, _, cx| {
-                let workspace = multi_workspace.workspace().clone();
-                workspace.update(cx, |workspace, cx| {
-                    workspace.show_toast(
-                        Toast::new(
-                            NotificationId::unique::<AttachRepository>(),
-                            "No session manifest found for this project",
-                        )
-                        .autohide(),
-                        cx,
-                    );
-                });
-            }).log_err();
+            multi_workspace
+                .update(cx, |multi_workspace, _, cx| {
+                    let workspace = multi_workspace.workspace().clone();
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<AttachRepository>(),
+                                "No session manifest found for this project",
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    });
+                })
+                .log_err();
             return;
         };
 
         let fs = <dyn Fs>::global(cx);
-        let cache_root = default_sessions_root()
-            .parent()
-            .map(|root| root.join("store"))
-            .unwrap_or_else(|| paths::home_dir().join(".session/store"));
+        let cache_root = zession_core::store_dir();
+        let settings = ZessionSettings::get_global(cx).clone();
         let Some(weak_workspace) = multi_workspace
             .read(cx)
             .ok()
@@ -336,6 +246,13 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
         else {
             return;
         };
+        let Some(http_client) = multi_workspace.read(cx).ok().map(|multi_workspace| {
+            let project = multi_workspace.workspace().read(cx).project().clone();
+            project.read(cx).client().http_client()
+        }) else {
+            return;
+        };
+        let http_client: Arc<dyn HttpClient> = http_client;
         multi_workspace
             .update(cx, move |multi_workspace, window, cx| {
                 let active_workspace = multi_workspace.workspace().clone();
@@ -347,6 +264,8 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
                             weak_workspace,
                             fs,
                             cache_root,
+                            settings,
+                            http_client,
                             window,
                             cx,
                         )
@@ -357,32 +276,15 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
     });
 }
 
-fn show_command_error(
-    workspace: gpui::WeakEntity<Workspace>,
-    message: String,
-    cx: &mut AsyncApp,
-) {
+fn show_session_error(workspace: gpui::WeakEntity<Workspace>, message: String, cx: &mut AsyncApp) {
     workspace
         .update(cx, |workspace, cx| {
             workspace.show_toast(
-                Toast::new(
-                    NotificationId::unique::<SessionCommandError>(),
-                    message,
-                )
-                .autohide(),
+                Toast::new(NotificationId::unique::<SessionCommandError>(), message).autohide(),
                 cx,
             );
         })
         .log_err();
-}
-
-fn command_output_error(status: std::process::ExitStatus, stderr: &str) -> String {
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        format!("session command exited with {status}")
-    } else {
-        stderr.to_string()
-    }
 }
 
 struct SessionCommandError;
@@ -390,6 +292,7 @@ struct SessionCommandError;
 struct CachedRepositoryPicker {
     workspace: gpui::WeakEntity<Workspace>,
     session_id: String,
+    settings: ZessionSettings,
     repositories: Vec<String>,
     filtered_repositories: Vec<StringMatch>,
     query_repository: Option<String>,
@@ -397,10 +300,15 @@ struct CachedRepositoryPicker {
 }
 
 impl CachedRepositoryPicker {
-    fn new(workspace: gpui::WeakEntity<Workspace>, session_id: String) -> Self {
+    fn new(
+        workspace: gpui::WeakEntity<Workspace>,
+        session_id: String,
+        settings: ZessionSettings,
+    ) -> Self {
         Self {
             workspace,
             session_id,
+            settings,
             repositories: Vec::new(),
             filtered_repositories: Vec::new(),
             query_repository: None,
@@ -410,6 +318,36 @@ impl CachedRepositoryPicker {
 
     fn set_repositories(&mut self, repositories: Vec<String>) {
         self.repositories = repositories;
+    }
+
+    fn attach_repository(&self, spec: zession_core::RepoSpec, cx: &mut Context<Picker<Self>>) {
+        let workspace = self.workspace.clone();
+        let session_id = self.session_id.clone();
+        let settings = self.settings.clone();
+        let task = cx.spawn(async move |_, cx| {
+            let result = zession_core::attach_repo(&session_id, &spec, None, None, &settings).await;
+            if let Err(error) = result {
+                return Err(format!("Failed to attach repository: {error:#}"));
+            }
+            start_session_indexing(spec, settings, cx);
+            Ok(())
+        });
+        let weak_picker = cx.weak_entity();
+        cx.spawn(async move |_, cx| match task.await {
+            Ok(()) => {
+                weak_picker
+                    .update(cx, |_, cx| cx.emit(DismissEvent))
+                    .log_err();
+            }
+            Err(error) => show_session_error(workspace, error, cx),
+        })
+        .detach();
+    }
+
+    fn show_error(&self, message: String, cx: &mut Context<Picker<Self>>) {
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |_, cx| show_session_error(workspace, message, cx))
+            .detach();
     }
 }
 
@@ -484,12 +422,7 @@ impl PickerDelegate for CachedRepositoryPicker {
         Task::ready(())
     }
 
-    fn confirm(
-        &mut self,
-        _secondary: bool,
-        _window: &mut Window,
-        cx: &mut Context<Picker<Self>>,
-    ) {
+    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let query_row_offset = usize::from(self.query_repository.is_some());
         let repository = if self.query_repository.is_some() && self.selected_index == 0 {
             self.query_repository.clone()
@@ -502,34 +435,41 @@ impl PickerDelegate for CachedRepositoryPicker {
         let Some(repository) = repository else {
             return;
         };
-        let workspace = self.workspace.clone();
-        let session_id = self.session_id.clone();
-        let command = cx.background_spawn(async move {
-            smol::process::Command::new("session")
-                .args(["repos", "add", &repository, "--session", &session_id])
-                .output()
-                .await
-        });
-        cx.spawn(async move |_, cx| match command.await {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                show_command_error(
-                    workspace,
-                    command_output_error(output.status, &stderr),
-                    cx,
-                );
-            }
+        let spec = match zession_core::RepoSpec::parse(&repository) {
+            Ok(spec) => spec,
             Err(error) => {
-                show_command_error(
-                    workspace,
-                    format!("Failed to attach repository: {error}"),
-                    cx,
-                );
+                self.show_error(format!("Invalid repository: {error:#}"), cx);
+                return;
             }
-        })
-        .detach();
-        cx.emit(DismissEvent);
+        };
+        match zession_core::is_allowed(&self.settings, &spec.repo_id) {
+            Ok(true) => self.attach_repository(spec, cx),
+            Ok(false) => {
+                let workspace = self.workspace.clone();
+                let modal_workspace = workspace.clone();
+                let session_id = self.session_id.clone();
+                let file_system = <dyn Fs>::global(cx);
+                let picker = cx.weak_entity();
+                workspace
+                    .update(cx, move |workspace, cx| {
+                        workspace.toggle_modal(window, cx, move |_, cx| {
+                            SessionApprovalModal::new(
+                                session_id,
+                                spec,
+                                file_system,
+                                modal_workspace,
+                                picker,
+                                cx,
+                            )
+                        });
+                    })
+                    .log_err();
+            }
+            Err(error) => self.show_error(
+                format!("Could not check repository approval: {error:#}"),
+                cx,
+            ),
+        }
     }
 
     fn dismissed(&mut self, _window: &mut Window, _cx: &mut Context<Picker<Self>>) {}
@@ -573,14 +513,33 @@ impl AttachRepositoryModal {
         workspace: gpui::WeakEntity<Workspace>,
         fs: Arc<dyn Fs>,
         cache_root: PathBuf,
+        settings: ZessionSettings,
+        http_client: Arc<dyn HttpClient>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let delegate = CachedRepositoryPicker::new(workspace, session.manifest.id);
+        let delegate =
+            CachedRepositoryPicker::new(workspace, session.manifest.id.clone(), settings.clone());
         let picker = cx.new(|cx| Picker::list(delegate, window, cx));
         let weak_picker = picker.downgrade();
         cx.spawn_in(window, async move |_, cx| {
-            let repositories = read_cached_repositories(fs, cache_root).await;
+            let mut repositories = match zession_core::search_repos(
+                "",
+                Some(&session.manifest.id),
+                &settings,
+                http_client,
+            )
+            .await
+            {
+                Ok(hits) => hits.into_iter().map(|hit| hit.repo_id).collect(),
+                Err(error) => {
+                    log::debug!("failed to load Session repository catalog: {error:#}");
+                    Vec::new()
+                }
+            };
+            repositories.extend(read_cached_repositories(fs, cache_root).await);
+            repositories.sort();
+            repositories.dedup();
             weak_picker
                 .update_in(cx, move |picker, window, cx| {
                     picker.delegate.set_repositories(repositories);
@@ -590,10 +549,8 @@ impl AttachRepositoryModal {
                 .log_err();
         })
         .detach();
-        let _subscription = cx.subscribe(
-            &picker,
-            |_, _, _: &DismissEvent, cx| cx.emit(DismissEvent),
-        );
+        let _subscription =
+            cx.subscribe(&picker, |_, _, _: &DismissEvent, cx| cx.emit(DismissEvent));
         Self {
             picker,
             _subscription,
@@ -611,11 +568,155 @@ impl Focusable for AttachRepositoryModal {
 
 impl Render for AttachRepositoryModal {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().w(rems(38.)).h(rems(30.)).child(self.picker.clone())
+        v_flex()
+            .w(rems(38.))
+            .h(rems(30.))
+            .child(self.picker.clone())
     }
 }
 
 impl ModalView for AttachRepositoryModal {}
+
+struct SessionApprovalModal {
+    session_id: String,
+    spec: zession_core::RepoSpec,
+    file_system: Arc<dyn Fs>,
+    workspace: gpui::WeakEntity<Workspace>,
+    picker: gpui::WeakEntity<Picker<CachedRepositoryPicker>>,
+    focus_handle: FocusHandle,
+}
+
+impl SessionApprovalModal {
+    fn new(
+        session_id: String,
+        spec: zession_core::RepoSpec,
+        file_system: Arc<dyn Fs>,
+        workspace: gpui::WeakEntity<Workspace>,
+        picker: gpui::WeakEntity<Picker<CachedRepositoryPicker>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            session_id,
+            spec,
+            file_system,
+            workspace,
+            picker,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl EventEmitter<DismissEvent> for SessionApprovalModal {}
+
+impl Focusable for SessionApprovalModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for SessionApprovalModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w(rems(30.))
+            .gap_3()
+            .p_4()
+            .child(Label::new(format!("Approve {}?", self.spec.repo_id)))
+            .child(Label::new("Allow this repository to be used by Zession?"))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("cancel-session-repo-approval", "Cancel")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        Button::new("approve-session-repo", "Approve").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                let repo_id = this.spec.repo_id.clone();
+                                let settings_repo_id = repo_id.clone();
+                                let file_system = this.file_system.clone();
+                                let session_id = this.session_id.clone();
+                                let spec = this.spec.clone();
+                                let workspace = this.workspace.clone();
+                                let picker = this.picker.clone();
+                                let settings_update = update_settings_file_with_completion(
+                                    file_system,
+                                    cx,
+                                    move |settings, _| {
+                                        let repos = settings
+                                            .zession
+                                            .get_or_insert_default()
+                                            .repos
+                                            .get_or_insert_default();
+                                        let allow = repos.allow.get_or_insert_default();
+                                        if !allow.iter().any(|entry| entry == &settings_repo_id) {
+                                            allow.push(settings_repo_id);
+                                        }
+                                    },
+                                );
+                                let mut settings = ZessionSettings::get_global(cx).clone();
+                                if !settings.repos_allow.contains(&repo_id) {
+                                    settings.repos_allow.push(repo_id);
+                                }
+                                cx.spawn(async move |_, cx| {
+                                    match settings_update.await {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(error)) => {
+                                            show_session_error(
+                                                workspace,
+                                                format!(
+                                                    "Could not save repository approval: {error:#}"
+                                                ),
+                                                cx,
+                                            );
+                                            return;
+                                        }
+                                        Err(error) => {
+                                            show_session_error(
+                                                workspace,
+                                                format!(
+                                                    "Could not save repository approval: {error}"
+                                                ),
+                                                cx,
+                                            );
+                                            return;
+                                        }
+                                    }
+                                    match zession_core::attach_repo(
+                                        &session_id,
+                                        &spec,
+                                        None,
+                                        None,
+                                        &settings,
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            start_session_indexing(spec, settings, cx);
+                                            picker
+                                                .update(cx, |_, cx| cx.emit(DismissEvent))
+                                                .log_err();
+                                        }
+                                        Err(error) => {
+                                            show_session_error(
+                                                workspace,
+                                                format!("Failed to attach repository: {error:#}"),
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                })
+                                .detach();
+                                cx.emit(DismissEvent);
+                            },
+                        )),
+                    ),
+            )
+    }
+}
+
+impl ModalView for SessionApprovalModal {}
 
 async fn read_cached_repositories(fs: Arc<dyn Fs>, cache_root: PathBuf) -> Vec<String> {
     let mut directories = vec![cache_root.clone()];
@@ -664,7 +765,33 @@ async fn read_cached_repositories(fs: Arc<dyn Fs>, cache_root: PathBuf) -> Vec<S
     repositories
 }
 
-async fn read_sessions(fs: Arc<dyn Fs>, root: &Path) -> (Vec<Session>, Vec<PathBuf>) {
+fn start_session_indexing(
+    spec: zession_core::RepoSpec,
+    settings: ZessionSettings,
+    cx: &mut AsyncApp,
+) {
+    if !settings.auto_index {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        let result = async {
+            let store = zession_core::ensure_store_fresh(
+                &spec,
+                Duration::from_secs(settings.store_max_age_minutes.saturating_mul(60)),
+                false,
+            )
+            .await?;
+            zession_core::index_repo_if_enabled(&settings, &store, cx).await
+        }
+        .await;
+        if let Err(error) = result {
+            log::debug!("failed to index attached repository: {error:#}");
+        }
+    })
+    .detach();
+}
+
+async fn read_sessions(fs: Arc<dyn Fs>, root: &Path) -> Vec<Session> {
     let mut directories = match fs.read_dir(root).await {
         Ok(directories) => directories,
         Err(error) => {
@@ -672,22 +799,23 @@ async fn read_sessions(fs: Arc<dyn Fs>, root: &Path) -> (Vec<Session>, Vec<PathB
                 "Failed to read session directory {}: {error:#}",
                 root.display()
             );
-            return (Vec::new(), Vec::new());
+            return Vec::new();
         }
     };
 
     let mut sessions = Vec::new();
-    let mut session_directories = Vec::new();
     while let Some(entry) = directories.next().await {
-        let Ok(dir) = entry else {
+        let Ok(manifest_path) = entry else {
             continue;
         };
-        if !fs.is_dir(&dir).await {
+        if fs.is_dir(&manifest_path).await
+            || manifest_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("json")
+        {
             continue;
         }
-        session_directories.push(dir.clone());
-
-        let manifest_path = dir.join("session.json");
         let contents = match fs.load(&manifest_path).await {
             Ok(contents) => contents,
             Err(error) => {
@@ -698,21 +826,32 @@ async fn read_sessions(fs: Arc<dyn Fs>, root: &Path) -> (Vec<Session>, Vec<PathB
                 continue;
             }
         };
-        if let Some(session) = parse_session(dir, &contents) {
-            sessions.push(session);
+        let Ok(manifest) = serde_json::from_str::<SessionManifest>(&contents) else {
+            log::debug!(
+                "Failed to parse Session manifest {}",
+                manifest_path.display()
+            );
+            continue;
+        };
+        if let Some(workspaces_root) = root.parent().map(|home| home.join("workspaces")) {
+            sessions.push(Session {
+                dir: workspaces_root.join(&manifest.id),
+                manifest,
+            });
         }
     }
 
     sort_sessions(&mut sessions);
-    (sessions, session_directories)
+    sessions
 }
 
+#[cfg(test)]
 fn parse_session(dir: PathBuf, contents: &str) -> Option<Session> {
     match serde_json::from_str(contents) {
         Ok(manifest) => Some(Session { dir, manifest }),
         Err(error) => {
             log::debug!(
-                "Failed to parse session manifest {}: {error:#}",
+                "Failed to parse Session manifest {}: {error:#}",
                 dir.join("session.json").display()
             );
             None
@@ -757,11 +896,11 @@ mod tests {
     #[test]
     fn parses_unknown_fields_and_falls_back_to_id() {
         let manifest = serde_json::from_str::<SessionManifest>(
-            r#"{"id":"demo-a","created":"2026-01-01T00:00:00Z","unknown":"ignored"}"#,
+            r#"{"version":1,"id":"demo-a","created":"2026-01-01T00:00:00Z","unknown":"ignored"}"#,
         )
         .expect("valid session manifest");
         let session = Session {
-            dir: PathBuf::from("/sessions/demo-a"),
+            dir: PathBuf::from("/zession/workspaces/demo-a"),
             manifest,
         };
 
@@ -771,18 +910,18 @@ mod tests {
     #[test]
     fn orders_by_last_opened_before_created() {
         let older = parse_session(
-            PathBuf::from("/sessions/older"),
-            r#"{"id":"older","created":"2026-02-01T00:00:00Z","lastOpened":"2026-02-02T00:00:00Z"}"#,
+            PathBuf::from("/zession/workspaces/older"),
+            r#"{"version":1,"id":"older","created":"2026-02-01T00:00:00Z","lastOpened":"2026-02-02T00:00:00Z"}"#,
         )
         .expect("valid manifest");
         let newer = parse_session(
-            PathBuf::from("/sessions/newer"),
-            r#"{"id":"newer","created":"2026-01-01T00:00:00Z","lastOpened":"2026-02-03T00:00:00Z"}"#,
+            PathBuf::from("/zession/workspaces/newer"),
+            r#"{"version":1,"id":"newer","created":"2026-01-01T00:00:00Z","lastOpened":"2026-02-03T00:00:00Z"}"#,
         )
         .expect("valid manifest");
         let created = parse_session(
-            PathBuf::from("/sessions/created"),
-            r#"{"id":"created","created":"2026-02-04T00:00:00Z"}"#,
+            PathBuf::from("/zession/workspaces/created"),
+            r#"{"version":1,"id":"created","created":"2026-02-04T00:00:00Z"}"#,
         )
         .expect("valid manifest");
         let mut sessions = vec![older, newer, created];
@@ -800,7 +939,7 @@ mod tests {
 
     #[test]
     fn skips_invalid_json() {
-        assert!(parse_session(PathBuf::from("/sessions/broken"), "{").is_none());
+        assert!(parse_session(PathBuf::from("/zession/workspaces/broken"), "{").is_none());
     }
 
     #[gpui::test]
@@ -831,20 +970,21 @@ mod tests {
     async fn store_scans_and_watches_session_manifests(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
-            "/sessions",
+            "/zession",
             serde_json::json!({
-                "first": {
-                    "session.json": r#"{"id":"first","created":"2026-01-01T00:00:00Z"}"#
+                "sessions": {
+                    "first.json": r#"{"version":1,"id":"first","created":"2026-01-01T00:00:00Z"}"#,
+                    "second.json": r#"{"version":1,"id":"second","created":"2026-02-01T00:00:00Z"}"#
                 },
-                "second": {
-                    "session.json": r#"{"id":"second","created":"2026-02-01T00:00:00Z"}"#
+                "workspaces": {
+                    "first": {},
+                    "second": {}
                 }
             }),
         )
         .await;
-        let store = cx.new(|cx| {
-            SessionStore::new(fs.clone(), PathBuf::from("/sessions"), cx)
-        });
+        let store =
+            cx.new(|cx| SessionStore::new(fs.clone(), PathBuf::from("/zession/sessions"), cx));
         let notifications = Arc::new(AtomicUsize::new(0));
         let observed_notifications = notifications.clone();
         cx.update(|cx| {
@@ -867,19 +1007,13 @@ mod tests {
         );
 
         notifications.store(0, Ordering::SeqCst);
-        fs.insert_tree(
-            "/sessions/newest",
-            serde_json::json!({
-                "session.json": r#"{"id":"newest","created":"2026-03-01T00:00:00Z"}"#
-            }),
+        fs.insert_file(
+            "/zession/sessions/newest.json",
+            br#"{"version":1,"id":"newest","created":"2026-03-01T00:00:00Z"}"#.to_vec(),
         )
         .await;
         cx.run_until_parked();
-
-        assert!(
-            notifications.load(Ordering::SeqCst) > 0,
-            "session changes should notify observers"
-        );
+        assert!(notifications.load(Ordering::SeqCst) > 0);
         assert_eq!(
             store.read_with(cx, |store, _| {
                 store
@@ -893,43 +1027,33 @@ mod tests {
 
         notifications.store(0, Ordering::SeqCst);
         fs.insert_file(
-            "/sessions/first/session.json",
-            br#"{"id":"first","title":"First Updated","created":"2026-01-01T00:00:00Z"}"#.to_vec(),
+            "/zession/sessions/first.json",
+            br#"{"version":1,"id":"first","title":"First Updated","created":"2026-01-01T00:00:00Z"}"#.to_vec(),
         )
         .await;
         cx.run_until_parked();
-
-        assert!(
-            notifications.load(Ordering::SeqCst) > 0,
-            "manifest changes should notify observers"
-        );
+        assert!(notifications.load(Ordering::SeqCst) > 0);
         assert_eq!(
             store.read_with(cx, |store, _| {
                 store
-                    .session_for_dir(Path::new("/sessions/first"))
+                    .session_for_dir(Path::new("/zession/workspaces/first"))
                     .map(Session::display_title)
             }),
             Some("First Updated".into())
         );
 
         fs.remove_file(
-            Path::new("/sessions/first/session.json"),
+            Path::new("/zession/sessions/first.json"),
             RemoveOptions::default(),
         )
         .await
         .expect("remove session manifest");
-        fs.remove_dir(Path::new("/sessions/first"), RemoveOptions::default())
-            .await
-            .expect("remove session directory");
         cx.run_until_parked();
-
-        assert!(
-            store.read_with(cx, |store, _| {
-                !store
-                    .sessions()
-                    .iter()
-                    .any(|session| session.manifest.id == "first")
-            })
-        );
+        assert!(store.read_with(cx, |store, _| {
+            !store
+                .sessions()
+                .iter()
+                .any(|session| session.manifest.id == "first")
+        }));
     }
 }

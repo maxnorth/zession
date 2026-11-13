@@ -29,9 +29,9 @@ use feature_flags::{
 };
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    EventEmitter, FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render,
+    SharedString, Task, TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle,
+    linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -64,7 +64,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
 use util::path_list::PathList;
 use workspace::{
-    CloseWindow, FocusWorkspaceSidebar, MoveProjectDown, MoveProjectUp, MultiWorkspace,
+    CloseWindow, FocusWorkspaceSidebar, ModalView, MoveProjectDown, MoveProjectUp, MultiWorkspace,
     MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread,
     ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
     ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
@@ -409,10 +409,11 @@ enum ListEntry {
     Terminal(TerminalEntry),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RenameTarget {
     Thread(ThreadId),
     Terminal(TerminalId),
+    Session(String),
 }
 
 impl RenameTarget {
@@ -950,10 +951,9 @@ impl Sidebar {
             })
             .unwrap_or_default();
         if !last_session_keys.is_empty() {
-            multi_workspace
-                .update(cx, |multi_workspace, cx| {
-                    multi_workspace.sync_session_groups(&last_session_keys, &[], cx);
-                });
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.sync_session_groups(&last_session_keys, &[], cx);
+            });
         }
         if let Some(session_store) = session_store {
             cx.observe(&session_store, |this, session_store, cx| {
@@ -971,14 +971,9 @@ impl Sidebar {
                     .collect::<Vec<_>>();
                 this.last_session_keys = session_keys.clone();
                 if let Some(multi_workspace) = this.multi_workspace.upgrade() {
-                    multi_workspace
-                        .update(cx, |multi_workspace, cx| {
-                            multi_workspace.sync_session_groups(
-                                &session_keys,
-                                &removed_keys,
-                                cx,
-                            );
-                        });
+                    multi_workspace.update(cx, |multi_workspace, cx| {
+                        multi_workspace.sync_session_groups(&session_keys, &removed_keys, cx);
+                    });
                 }
                 this.schedule_update_entries(false, cx);
             })
@@ -1672,8 +1667,7 @@ impl Sidebar {
             } else {
                 None
             };
-            let label =
-                session_title.unwrap_or_else(|| group_key.display_name(&path_detail_map));
+            let label = session_title.unwrap_or_else(|| group_key.display_name(&path_detail_map));
 
             let is_collapsed = self.is_group_collapsed(group_key, cx);
             let should_load_threads = !is_collapsed || !query.is_empty();
@@ -2409,6 +2403,16 @@ impl Sidebar {
         let host = key.host();
 
         let has_filter = self.has_filter_query(cx);
+        let session_id = SessionStore::try_global(cx).and_then(|store| {
+            let session_dir = key.path_list().paths().first()?;
+            store
+                .read(cx)
+                .session_for_dir(session_dir)
+                .map(|session| session.manifest.id.clone())
+        });
+        let is_renaming = session_id.as_ref().is_some_and(|session_id| {
+            self.rename_target.as_ref() == Some(&RenameTarget::Session(session_id.clone()))
+        });
 
         let id_prefix = if is_sticky { "sticky-" } else { "" };
         let id = SharedString::from(format!("{id_prefix}project-header-{ix}"));
@@ -2424,11 +2428,19 @@ impl Sidebar {
         let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
 
-        let color = cx.theme().colors();
-        let sidebar_base_bg = if is_sticky {
-            color.panel_background_for_overlay()
-        } else {
-            color.panel_background
+        let (background_color, hover_color, active_color, focused_border_color, sidebar_base_bg) = {
+            let color = cx.theme().colors();
+            (
+                color.background,
+                color.ghost_element_hover,
+                color.ghost_element_active,
+                color.panel_focused_border,
+                if is_sticky {
+                    color.panel_background_for_overlay()
+                } else {
+                    color.panel_background
+                },
+            )
         };
 
         // The fade gradient renders as a visible patch on transparent windows,
@@ -2437,7 +2449,9 @@ impl Sidebar {
             == WindowBackgroundAppearance::Opaque
             && sidebar_base_bg.a >= 1.0;
 
-        let label = if highlight_positions.is_empty() {
+        let label = if is_renaming {
+            self.render_rename_title_editor(cx)
+        } else if highlight_positions.is_empty() {
             Label::new(label.clone())
                 .when(!is_active, |this| this.color(Color::Muted))
                 .when(!opaque_window, |this| this.truncate())
@@ -2449,10 +2463,10 @@ impl Sidebar {
                 .into_any_element()
         };
 
-        let base_bg = color.background.blend(sidebar_base_bg);
+        let base_bg = background_color.blend(sidebar_base_bg);
 
-        let hover_solid = base_bg.blend(color.ghost_element_hover);
-        let active_solid = base_bg.blend(color.ghost_element_active);
+        let hover_solid = base_bg.blend(hover_color);
+        let active_solid = base_bg.blend(active_color);
 
         let group_name_for_gradient = group_name.clone();
         let gradient_overlay = move || {
@@ -2479,14 +2493,14 @@ impl Sidebar {
             .border_r_2()
             .map(|this| {
                 if is_focused {
-                    this.border_color(color.panel_focused_border)
+                    this.border_color(focused_border_color)
                 } else {
                     this.border_color(gpui::transparent_black())
                 }
             })
             .when(!has_filter, |this| {
-                this.hover(|s| s.bg(color.ghost_element_hover))
-                    .group_active(&group_name, |s| s.bg(color.ghost_element_active))
+                this.hover(|s| s.bg(hover_color))
+                    .group_active(&group_name, |s| s.bg(active_color))
             })
             .child(
                 h_flex()
@@ -2938,6 +2952,7 @@ impl Sidebar {
         group_name: &SharedString,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let group_name = group_name.clone();
         let multi_workspace = self.multi_workspace.clone();
         let project_group_key = project_group_key.clone();
         let session_directory = if project_group_key.path_list().paths().len() == 1 {
@@ -2980,7 +2995,7 @@ impl Sidebar {
                     })
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .icon_size(IconSize::Small)
-                    .when(!is_menu_open, |el| el.visible_on_hover(group_name)),
+                    .when(!is_menu_open, |el| el.visible_on_hover(group_name.clone())),
             )
             .on_open(Rc::new({
                 let this = this.clone();
@@ -3034,6 +3049,7 @@ impl Sidebar {
                     .map(|workspace| active_workspace.as_ref() == Some(workspace))
                     .collect();
 
+                let group_name_for_menu = group_name.clone();
                 let menu =
                     ContextMenu::build_persistent(window, cx, move |menu, _window, menu_cx| {
                         let menu = menu.end_slot_action(Box::new(menu::SecondaryConfirm));
@@ -3280,7 +3296,14 @@ impl Sidebar {
                         let menu = if let Some(session_directory) = session_directory.as_ref() {
                             let attach_session_directory = session_directory.clone();
                             let attach_weak_menu = weak_menu.clone();
-                            menu.entry(
+                            let rename_session_id = session_directory
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map(str::to_owned);
+                            let rename_sidebar = this_for_menu.clone();
+                            let rename_weak_menu = weak_menu.clone();
+                            let session_title = group_name_for_menu.clone();
+                            let mut menu = menu.entry(
                                 "Attach Repository…",
                                 Some(Box::new(zession::AttachRepository {
                                     session_dir: Some(session_directory.clone()),
@@ -3288,9 +3311,7 @@ impl Sidebar {
                                 move |window, cx| {
                                     window.dispatch_action(
                                         Box::new(zession::AttachRepository {
-                                            session_dir: Some(
-                                                attach_session_directory.clone(),
-                                            ),
+                                            session_dir: Some(attach_session_directory.clone()),
                                         }),
                                         cx,
                                     );
@@ -3298,7 +3319,56 @@ impl Sidebar {
                                         .update(cx, |_, cx| cx.emit(DismissEvent))
                                         .ok();
                                 },
-                            )
+                            );
+                            if let Some(session_id) = rename_session_id {
+                                let session_id_for_rename = session_id.clone();
+                                menu = menu.entry("Rename Session…", None, move |window, cx| {
+                                    let session_id = session_id_for_rename.clone();
+                                    let session_title = session_title.clone();
+                                    rename_sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.start_renaming_entry(
+                                                ix,
+                                                RenameTarget::Session(session_id),
+                                                session_title,
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                    rename_weak_menu
+                                        .update(cx, |_, cx| cx.emit(DismissEvent))
+                                        .ok();
+                                });
+
+                                let delete_multi_workspace = multi_workspace.clone();
+                                let delete_weak_menu = weak_menu.clone();
+                                let delete_session_id = session_id;
+                                menu = menu.entry("Delete Session…", None, move |window, cx| {
+                                    if let Some(workspace) = delete_multi_workspace
+                                        .read_with(cx, |multi_workspace, _| {
+                                            multi_workspace.workspace().clone()
+                                        })
+                                        .ok()
+                                    {
+                                        let session_id = delete_session_id.clone();
+                                        let weak_workspace = workspace.downgrade();
+                                        workspace.update(cx, |workspace, cx| {
+                                            workspace.toggle_modal(window, cx, move |_, cx| {
+                                                DeleteSessionModal::new(
+                                                    session_id,
+                                                    weak_workspace,
+                                                    cx,
+                                                )
+                                            });
+                                        });
+                                    }
+                                    delete_weak_menu
+                                        .update(cx, |_, cx| cx.emit(DismissEvent))
+                                        .ok();
+                                });
+                            }
+                            menu
                         } else {
                             menu
                         };
@@ -3544,7 +3614,7 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.rename_target == Some(target) {
+        if self.rename_target.as_ref() == Some(&target) {
             self.rename_editor.update(cx, |editor, cx| {
                 editor.select_all(&editor::actions::SelectAll, window, cx);
                 editor.focus_handle(cx).focus(window, cx);
@@ -3584,10 +3654,10 @@ impl Sidebar {
                     return;
                 }
                 let new_title = title_editor.read(cx).text(cx);
-                let Some(target) = self.rename_target else {
+                let Some(target) = self.rename_target.clone() else {
                     return;
                 };
-                if matches!(target, RenameTarget::Thread(_)) && new_title.is_empty() {
+                if matches!(&target, RenameTarget::Thread(_)) && new_title.is_empty() {
                     return;
                 }
                 let new_title = SharedString::from(new_title);
@@ -3597,6 +3667,15 @@ impl Sidebar {
                     }
                     RenameTarget::Terminal(terminal_id) => {
                         self.apply_terminal_rename(terminal_id, new_title, cx);
+                    }
+                    RenameTarget::Session(session_id) => {
+                        if let Err(error) = zession_core::set_title(
+                            &session_id,
+                            new_title.as_ref(),
+                            zession_core::TitleSource::User,
+                        ) {
+                            log::error!("Failed to rename Session {session_id}: {error:#}");
+                        }
                     }
                 }
             }
@@ -7657,9 +7736,7 @@ impl Sidebar {
             .child(
                 IconButton::new("new-session", IconName::Plus)
                     .icon_size(IconSize::Small)
-                    .tooltip(|_, cx| {
-                        Tooltip::for_action("New Session", &zession::NewSession, cx)
-                    })
+                    .tooltip(|_, cx| Tooltip::for_action("New Session", &zession::NewSession, cx))
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(zession::NewSession), cx);
                     }),
@@ -7904,6 +7981,85 @@ impl Sidebar {
         cx.notify();
     }
 }
+
+struct DeleteSessionModal {
+    session_id: String,
+    workspace: WeakEntity<Workspace>,
+    focus_handle: FocusHandle,
+}
+
+impl DeleteSessionModal {
+    fn new(session_id: String, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+        Self {
+            session_id,
+            workspace,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl EventEmitter<DismissEvent> for DeleteSessionModal {}
+
+impl Focusable for DeleteSessionModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for DeleteSessionModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w(rems(30.))
+            .gap_3()
+            .p_4()
+            .child(Label::new("Delete Session?"))
+            .child(Label::new(
+                "All attached worktrees and their uncommitted changes will be removed. Repository caches will be kept.",
+            ))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("cancel-session-delete", "Cancel")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        Button::new("confirm-session-delete", "Delete Session")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let session_id = this.session_id.clone();
+                                let workspace = this.workspace.clone();
+                                cx.spawn(async move |_, cx| {
+                                    if let Err(error) =
+                                        zession_core::remove_session(&session_id).await
+                                    {
+                                        workspace
+                                            .update(cx, |workspace, cx| {
+                                                workspace.show_toast(
+                                                    Toast::new(
+                                                        NotificationId::unique::<DeleteSessionError>(),
+                                                        format!(
+                                                            "Failed to delete Session: {error:#}"
+                                                        ),
+                                                    )
+                                                    .autohide(),
+                                                    cx,
+                                                );
+                                            })
+                                            .log_err();
+                                    }
+                                })
+                                .detach();
+                                cx.emit(DismissEvent);
+                            })),
+                    ),
+            )
+    }
+}
+
+struct DeleteSessionError;
+
+impl ModalView for DeleteSessionModal {}
 
 fn render_import_onboarding_banner(
     id: impl Into<SharedString>,

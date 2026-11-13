@@ -255,6 +255,7 @@ members = [
     "crates/zlog_settings",
     "crates/ztracing",
     "crates/ztracing_macro",
+    "crates/zession_core",
 
     #
     # Extensions
@@ -523,6 +524,7 @@ zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 zession = { path = "crates/zession" }
+zession_core = { path = "crates/zession_core" }
 zeta_prompt = { path = "crates/zeta_prompt" }
 zlog = { path = "crates/zlog" }
 zlog_settings = { path = "crates/zlog_settings" }

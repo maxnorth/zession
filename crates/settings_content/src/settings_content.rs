@@ -12,6 +12,7 @@ mod terminal;
 mod theme;
 mod title_bar;
 mod workspace;
+mod zession;
 
 pub use action::{ActionName, ActionWithArguments, CommandAliasTarget};
 pub use agent::*;
@@ -32,6 +33,7 @@ pub use terminal::*;
 pub use theme::*;
 pub use title_bar::*;
 pub use workspace::*;
+pub use zession::*;
 
 use collections::{HashMap, IndexMap, IndexSet};
 use schemars::JsonSchema;
@@ -301,6 +303,7 @@ pub struct SettingsContent {
 
     /// Configuration for session-related features
     pub session: Option<SessionSettingsContent>,
+    pub zession: Option<ZessionSettingsContent>,
     /// Control what info is collected by Zed.
     pub telemetry: Option<TelemetrySettingsContent>,
 
@@ -411,7 +414,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,
-        node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
+        node, proxy, reduce_motion, server_url, credentials_url, session, zession, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
         instrumentation,
     },
